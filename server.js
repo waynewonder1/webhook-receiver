@@ -25,6 +25,8 @@ app.post('/webhook', async function (req, res) {
 
   const name = req.body.name;
   const message = req.body.message;
+  const email = req.body.email || null;
+  const platform = req.body.platform || 'Unknown';
 
   // Step 1: Save to Supabase
   const supabaseResponse = await fetch(
@@ -37,7 +39,7 @@ app.post('/webhook', async function (req, res) {
         'Content-Type': 'application/json',
         'Prefer': 'return=representation'
       },
-      body: JSON.stringify({ name: name, message: message })
+      body: JSON.stringify({ name: name, message: message, email: email, platform: platform })
     }
   );
 
@@ -58,7 +60,7 @@ app.post('/webhook', async function (req, res) {
       body: JSON.stringify({
         contents: [{
           parts: [{
-            text: `Score this lead 1-10 on buying intent. Name: ${name}. Message: ${message}`
+            text: `Score this lead 1-10 on buying intent. Name: ${name}. Platform: ${platform}. Message: ${message}`
           }]
         }]
       })
@@ -88,8 +90,8 @@ app.post('/webhook', async function (req, res) {
   await transporter.sendMail({
     from: process.env.GMAIL_USER,
     to: process.env.GMAIL_USER,
-    subject: `New lead scored: ${name}`,
-    text: `${name} just got scored.\n\nMessage: ${message}\n\nAI Score: ${scoreText}`
+    subject: `New lead scored: ${name} (${platform})`,
+    text: `${name} just got scored.\n\nPlatform: ${platform}\nEmail: ${email || 'not provided'}\nMessage: ${message}\n\nAI Score: ${scoreText}`
   });
 
   console.log('Email sent for lead:', leadId);
