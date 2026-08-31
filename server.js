@@ -154,27 +154,6 @@ app.post('/webhook', async function (req, res) {
   res.status(200).send('OK');
 });
 
-// TEMPORARY - remove after testing
-app.get('/test-email', async function (req, res) {
-  console.log('Testing with GMAIL_USER:', process.env.GMAIL_USER);
-  console.log('GMAIL_PASS is set:', !!process.env.GMAIL_PASS, '(length:', (process.env.GMAIL_PASS || '').length, ')');
-
-  try {
-    const info = await transporter.sendMail({
-      from: process.env.GMAIL_USER,
-      to: process.env.GMAIL_USER,
-      subject: 'Standalone email test',
-      text: 'If you got this, SMTP works fine on its own.'
-    });
-    console.log('SUCCESS - Email sent:', info.response);
-    res.send('Email sent - check your inbox and the logs');
-  } catch (err) {
-    console.error('FAILED - Error name:', err.name);
-    console.error('FAILED - Error message:', err.message);
-    res.status(500).send('Email failed - check the logs for the error: ' + err.message);
-  }
-});
-
 app.listen(3000, function () {
   console.log('WebHook receiver running on http://localhost:3000');
 });
