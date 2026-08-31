@@ -5,7 +5,10 @@ const app = express();
 const nodemailer = require('nodemailer');
 
 const transporter = nodemailer.createTransport({
-  service: 'gmail',
+  host: 'smtp.gmail.com',
+  port: 465,
+  secure: true,
+  family: 4, // force IPv4 - Render's network can't reach Gmail over IPv6
   auth: {
     user: process.env.GMAIL_USER,
     pass: process.env.GMAIL_PASS
