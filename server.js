@@ -1,5 +1,9 @@
 require('dotenv').config();
 
+// Force Node to prefer IPv4 for all DNS lookups. Render's outbound network
+// can't reach Gmail's SMTP server over IPv6, which was causing ENETUNREACH.
+require('dns').setDefaultResultOrder('ipv4first');
+
 const express = require('express');
 const app = express();
 const nodemailer = require('nodemailer');
