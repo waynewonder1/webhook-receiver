@@ -62,37 +62,59 @@ app.post('/webhook', async function (req, res) {
 
   // From here on, the lead is safely saved. Nothing below should be able
   // to break the response the sender/webhook gets back.
-  try {
-    // Step 2: Score with Gemini
-    const geminiResponse = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent',
-      {
-        method: 'POST',
-        headers: {
-          'x-goog-api-key': process.env.GEMINI_KEY,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          contents: [{
-            parts: [{
-              text: `Score this lead 1-10 on buying intent. Name: ${name}. Platform: ${platform}. Message: ${message}`
+  let scoreText = null;
+
+  // Step 2: Score with Gemini (with retry — Gemini occasionally returns a
+  // temporary 503 "high demand" error, which usually clears within seconds)
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const geminiResponse = await fetch(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent',
+        {
+          method: 'POST',
+          headers: {
+            'x-goog-api-key': process.env.GEMINI_KEY,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            contents: [{
+              parts: [{
+                text: `Score this lead 1-10 on buying intent. Name: ${name}. Platform: ${platform}. Message: ${message}`
+              }]
             }]
-          }]
-        })
+          })
+        }
+      );
+
+      const geminiData = await geminiResponse.json();
+
+      if (!geminiResponse.ok || !geminiData.candidates || !geminiData.candidates[0]) {
+        console.error(`Gemini API error (attempt ${attempt}):`, JSON.stringify(geminiData));
+        // 503 = temporary overload on Google's side, worth retrying.
+        // Anything else (bad key, invalid model, etc.) won't fix itself, so stop retrying.
+        if (geminiData?.error?.code === 503 && attempt < 3) {
+          await new Promise(r => setTimeout(r, attempt * 1000)); // wait 1s, then 2s
+          continue;
+        }
+        break;
       }
-    );
 
-    const geminiData = await geminiResponse.json();
+      scoreText = geminiData.candidates[0].content.parts[0].text;
+      console.log('Gemini score:', scoreText);
+      break;
+    } catch (err) {
+      console.error(`Gemini call threw (attempt ${attempt}):`, err.message);
+      break;
+    }
+  }
 
-    if (!geminiResponse.ok || !geminiData.candidates || !geminiData.candidates[0]) {
-      console.error('Gemini API error:', JSON.stringify(geminiData));
-      throw new Error('Gemini scoring failed');
+  try {
+    // Step 3: Save the score back to Supabase (only if we actually got one)
+    if (scoreText === null) {
+      console.error('Skipping Supabase score update and email — no score for lead', leadId);
+      return res.status(200).send('OK');
     }
 
-    const scoreText = geminiData.candidates[0].content.parts[0].text;
-    console.log('Gemini score:', scoreText);
-
-    // Step 3: Save the score back to Supabase
     await fetch(
       `${process.env.SUPABASE_URL}/rest/v1/leads_v2?id=eq.${leadId}`,
       {
@@ -123,6 +145,27 @@ app.post('/webhook', async function (req, res) {
   }
 
   res.status(200).send('OK');
+});
+
+// TEMPORARY - remove after testing
+app.get('/test-email', async function (req, res) {
+  console.log('Testing with GMAIL_USER:', process.env.GMAIL_USER);
+  console.log('GMAIL_PASS is set:', !!process.env.GMAIL_PASS, '(length:', (process.env.GMAIL_PASS || '').length, ')');
+
+  try {
+    const info = await transporter.sendMail({
+      from: process.env.GMAIL_USER,
+      to: process.env.GMAIL_USER,
+      subject: 'Standalone email test',
+      text: 'If you got this, SMTP works fine on its own.'
+    });
+    console.log('SUCCESS - Email sent:', info.response);
+    res.send('Email sent - check your inbox and the logs');
+  } catch (err) {
+    console.error('FAILED - Error name:', err.name);
+    console.error('FAILED - Error message:', err.message);
+    res.status(500).send('Email failed - check the logs for the error: ' + err.message);
+  }
 });
 
 app.listen(3000, function () {
