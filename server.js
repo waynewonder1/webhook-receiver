@@ -76,7 +76,7 @@ app.post('/webhook', async function (req, res) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const geminiResponse = await fetch(
-        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent',
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
         {
           method: 'POST',
           headers: {
@@ -116,32 +116,33 @@ app.post('/webhook', async function (req, res) {
   }
 
   try {
-    // Step 3: Save the score back to Supabase (only if we actually got one)
+    // Step 3: Save the score back to Supabase (only if we actually got one).
+    // If scoring failed we still want the email to go out — the score is a
+    // nice-to-have, the lead notification is the point.
     if (scoreText === null) {
-      console.error('Skipping Supabase score update and email — no score for lead', leadId);
-      return res.status(200).send('OK');
+      console.error('No Gemini score for lead', leadId, '— emailing anyway without a score');
+    } else {
+      await fetch(
+        `${process.env.SUPABASE_URL}/rest/v1/leads_v2?id=eq.${leadId}`,
+        {
+          method: 'PATCH',
+          headers: {
+            'apikey': process.env.SUPABASE_KEY,
+            'authorization': `Bearer ${process.env.SUPABASE_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ ai_score: scoreText })
+        }
+      );
+      console.log('Score saved back to Supabase for lead:', leadId);
     }
-
-    await fetch(
-      `${process.env.SUPABASE_URL}/rest/v1/leads_v2?id=eq.${leadId}`,
-      {
-        method: 'PATCH',
-        headers: {
-          'apikey': process.env.SUPABASE_KEY,
-          'authorization': `Bearer ${process.env.SUPABASE_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ ai_score: scoreText })
-      }
-    );
-    console.log('Score saved back to Supabase for lead:', leadId);
 
     // Step 4: Email yourself the result
     await transporter.sendMail({
       from: process.env.GMAIL_USER,
       to: process.env.GMAIL_USER,
       subject: `New lead scored: ${name} (${platform})`,
-      text: `${name} just got scored.\n\nPlatform: ${platform}\nEmail: ${email || 'not provided'}\nMessage: ${message}\n\nAI Score: ${scoreText}`
+      text: `${name} just got scored.\n\nPlatform: ${platform}\nEmail: ${email || 'not provided'}\nMessage: ${message}\n\nAI Score: ${scoreText === null ? 'unavailable (Gemini scoring failed)' : scoreText}`
     });
 
     console.log('Email sent for lead:', leadId);
