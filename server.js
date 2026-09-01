@@ -26,20 +26,61 @@ app.use(function (req, res, next) {
 
 app.use(express.json());
 
+// Small helper: wraps fetch with a timeout so a hanging request (Gemini,
+// Supabase, anything) fails fast instead of blocking forever.
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Meta calls this with a GET request to verify you control this URL,
+// before it will send any real webhook events (POST requests) to it.
+app.get('/webhook', function (req, res) {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode === 'subscribe' && token === process.env.META_VERIFY_TOKEN) {
+    console.log('Webhook verified by Meta');
+    res.status(200).send(challenge);
+  } else {
+    console.log('Webhook verification failed - token mismatch or wrong mode');
+    res.sendStatus(403);
+  }
+});
+
 app.post('/webhook', async function (req, res) {
   console.log('New message received:');
   console.log(req.body);
+
+  // Basic shared-secret check so random people can't POST to this endpoint
+  // and trigger real Gemini calls (which cost money) and emails to you.
+  // Set WEBHOOK_SECRET on Render, and send the same value as this header
+  // from whatever is calling this webhook.
+  if (process.env.WEBHOOK_SECRET && req.headers['x-webhook-secret'] !== process.env.WEBHOOK_SECRET) {
+    console.error('Rejected request - missing or wrong x-webhook-secret header');
+    return res.sendStatus(401);
+  }
 
   const name = req.body.name;
   const message = req.body.message;
   const email = req.body.email || null;
   const platform = req.body.platform || 'Unknown';
 
-  let leadId;
+  if (!name || !message) {
+    console.error('Rejected request - missing required fields (name/message)');
+    return res.status(400).send('Missing required fields: name and message');
+  }
 
-  // Step 1: Save to Supabase
+  // Step 1: Save to Supabase. This is the ONLY thing the sender waits on.
+  let leadId;
   try {
-    const supabaseResponse = await fetch(
+    const supabaseResponse = await fetchWithTimeout(
       `${process.env.SUPABASE_URL}/rest/v1/leads_v2`,
       {
         method: 'POST',
@@ -50,7 +91,8 @@ app.post('/webhook', async function (req, res) {
           'Prefer': 'return=representation'
         },
         body: JSON.stringify({ name: name, message: message, email: email, platform: platform })
-      }
+      },
+      8000 // 8s timeout
     );
 
     const savedLead = await supabaseResponse.json();
@@ -67,15 +109,25 @@ app.post('/webhook', async function (req, res) {
     return res.status(500).send('Server error saving lead');
   }
 
-  // From here on, the lead is safely saved. Nothing below should be able
-  // to break the response the sender/webhook gets back.
+  // Respond immediately - the lead is safely saved, so whoever/whatever
+  // sent this webhook doesn't need to wait on Gemini or Gmail, which can
+  // take several seconds (especially with retries). This also protects
+  // against webhook providers that time out and re-send if you're slow.
+  res.status(200).send('OK');
+
+  // Everything below runs in the background, AFTER the response above has
+  // already gone out. Nothing here can affect what the sender sees.
+  processLeadInBackground(leadId, name, message, email, platform);
+});
+
+async function processLeadInBackground(leadId, name, message, email, platform) {
   let scoreText = null;
 
-  // Step 2: Score with Gemini (with retry — Gemini occasionally returns a
+  // Step 2: Score with Gemini (with retry - Gemini occasionally returns a
   // temporary 503 "high demand" error, which usually clears within seconds)
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const geminiResponse = await fetch(
+      const geminiResponse = await fetchWithTimeout(
         'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
         {
           method: 'POST',
@@ -90,7 +142,8 @@ app.post('/webhook', async function (req, res) {
               }]
             }]
           })
-        }
+        },
+        10000 // 10s timeout per attempt
       );
 
       const geminiData = await geminiResponse.json();
@@ -98,7 +151,7 @@ app.post('/webhook', async function (req, res) {
       if (!geminiResponse.ok || !geminiData.candidates || !geminiData.candidates[0]) {
         console.error(`Gemini API error (attempt ${attempt}):`, JSON.stringify(geminiData));
         // 503 = temporary overload on Google's side, worth retrying.
-        // Anything else (bad key, invalid model, etc.) won't fix itself, so stop retrying.
+        // Anything else (bad key, invalid model, etc.) won't fix itself.
         if (geminiData?.error?.code === 503 && attempt < 3) {
           await new Promise(r => setTimeout(r, attempt * 1000)); // wait 1s, then 2s
           continue;
@@ -111,18 +164,18 @@ app.post('/webhook', async function (req, res) {
       break;
     } catch (err) {
       console.error(`Gemini call threw (attempt ${attempt}):`, err.message);
-      break;
+      break; // includes timeout aborts from fetchWithTimeout
     }
   }
 
   try {
-    // Step 3: Save the score back to Supabase (only if we actually got one).
-    // If scoring failed we still want the email to go out — the score is a
-    // nice-to-have, the lead notification is the point.
+    // Step 3: Save the score back to Supabase, only if we got one.
+    // If scoring failed we still email you - the score is a nice-to-have,
+    // the lead notification is the point.
     if (scoreText === null) {
-      console.error('No Gemini score for lead', leadId, '— emailing anyway without a score');
+      console.error('No Gemini score for lead', leadId, '- emailing anyway without a score');
     } else {
-      await fetch(
+      await fetchWithTimeout(
         `${process.env.SUPABASE_URL}/rest/v1/leads_v2?id=eq.${leadId}`,
         {
           method: 'PATCH',
@@ -132,7 +185,8 @@ app.post('/webhook', async function (req, res) {
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({ ai_score: scoreText })
-        }
+        },
+        8000
       );
       console.log('Score saved back to Supabase for lead:', leadId);
     }
@@ -148,12 +202,10 @@ app.post('/webhook', async function (req, res) {
     console.log('Email sent for lead:', leadId);
   } catch (err) {
     // Scoring or emailing failed, but the lead itself is already saved,
-    // so we log the problem instead of crashing the request.
+    // so we just log the problem - there's no request left to respond to.
     console.error('Post-save processing failed for lead', leadId, '-', err.message);
   }
-
-  res.status(200).send('OK');
-});
+}
 
 app.listen(3000, function () {
   console.log('WebHook receiver running on http://localhost:3000');
