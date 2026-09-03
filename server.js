@@ -1,23 +1,17 @@
 require('dotenv').config();
 
-// Force Node to prefer IPv4 for all DNS lookups. Render's outbound network
-// can't reach Gmail's SMTP server over IPv6, which was causing ENETUNREACH.
-require('dns').setDefaultResultOrder('ipv4first');
-
 const express = require('express');
 const app = express();
-const nodemailer = require('nodemailer');
 
-const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 465,
-  secure: true,
-  family: 4, // force IPv4 - Render's network can't reach Gmail over IPv6
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_PASS
-  }
-});
+// Email is sent through Resend's HTTP API (https://api.resend.com, port 443)
+// instead of SMTP. Render blocks outbound SMTP ports (25/465/587), so
+// nodemailer/Gmail could never actually connect from here.
+//   RESEND_API_KEY - from the Resend dashboard (starts with "re_")
+//   MAIL_TO        - the address that receives the lead alerts
+//   MAIL_FROM      - optional; a verified Resend sender. Defaults to
+//                    onboarding@resend.dev, which can only deliver to the
+//                    email you signed up to Resend with.
+const MAIL_FROM = process.env.MAIL_FROM || 'onboarding@resend.dev';
 
 app.use(function (req, res, next) {
   console.log('Incoming request:', req.method, req.url);
@@ -191,15 +185,31 @@ async function processLeadInBackground(leadId, name, message, email, platform) {
       console.log('Score saved back to Supabase for lead:', leadId);
     }
 
-    // Step 4: Email yourself the result
-    await transporter.sendMail({
-      from: process.env.GMAIL_USER,
-      to: process.env.GMAIL_USER,
-      subject: `New lead scored: ${name} (${platform})`,
-      text: `${name} just got scored.\n\nPlatform: ${platform}\nEmail: ${email || 'not provided'}\nMessage: ${message}\n\nAI Score: ${scoreText === null ? 'unavailable (Gemini scoring failed)' : scoreText}`
-    });
+    // Step 4: Email yourself the result (via Resend's HTTP API)
+    const emailResponse = await fetchWithTimeout(
+      'https://api.resend.com/emails',
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          from: MAIL_FROM,
+          to: process.env.MAIL_TO,
+          subject: `New lead scored: ${name} (${platform})`,
+          text: `${name} just got scored.\n\nPlatform: ${platform}\nEmail: ${email || 'not provided'}\nMessage: ${message}\n\nAI Score: ${scoreText === null ? 'unavailable (Gemini scoring failed)' : scoreText}`
+        })
+      },
+      10000
+    );
 
-    console.log('Email sent for lead:', leadId);
+    const emailResult = await emailResponse.json();
+    if (!emailResponse.ok) {
+      console.error('Resend API error for lead', leadId, '-', JSON.stringify(emailResult));
+    } else {
+      console.log('Email sent for lead:', leadId, '- Resend id:', emailResult.id);
+    }
   } catch (err) {
     // Scoring or emailing failed, but the lead itself is already saved,
     // so we just log the problem - there's no request left to respond to.
