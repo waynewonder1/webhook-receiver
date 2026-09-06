@@ -1,17 +1,23 @@
 require('dotenv').config();
 
+// Force Node to prefer IPv4 for all DNS lookups. Render's outbound network
+// can't reach Gmail's SMTP server over IPv6, which was causing ENETUNREACH.
+require('dns').setDefaultResultOrder('ipv4first');
+
 const express = require('express');
 const app = express();
+const nodemailer = require('nodemailer');
 
-// Email is sent through Resend's HTTP API (https://api.resend.com, port 443)
-// instead of SMTP. Render blocks outbound SMTP ports (25/465/587), so
-// nodemailer/Gmail could never actually connect from here.
-//   RESEND_API_KEY - from the Resend dashboard (starts with "re_")
-//   MAIL_TO        - the address that receives the lead alerts
-//   MAIL_FROM      - optional; a verified Resend sender. Defaults to
-//                    onboarding@resend.dev, which can only deliver to the
-//                    email you signed up to Resend with.
-const MAIL_FROM = process.env.MAIL_FROM || 'onboarding@resend.dev';
+const transporter = nodemailer.createTransport({
+  host: 'smtp.gmail.com',
+  port: 465,
+  secure: true,
+  family: 4, // force IPv4 - Render's network can't reach Gmail over IPv6
+  auth: {
+    user: process.env.GMAIL_USER,
+    pass: process.env.GMAIL_PASS
+  }
+});
 
 app.use(function (req, res, next) {
   console.log('Incoming request:', req.method, req.url);
@@ -29,6 +35,39 @@ async function fetchWithTimeout(url, options, timeoutMs) {
     return await fetch(url, { ...options, signal: controller.signal });
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+// Instagram's webhook only gives you the sender's numeric ID, not their
+// name. This looks up their real name/username via the Graph API.
+// Requires INSTAGRAM_ACCESS_TOKEN to be set on Render (the token you
+// generated in "Generate access tokens"). Returns null on any failure -
+// callers should fall back to using the raw ID instead.
+async function getInstagramSenderName(senderId) {
+  if (!process.env.INSTAGRAM_ACCESS_TOKEN) {
+    console.error('INSTAGRAM_ACCESS_TOKEN not set - cannot look up sender name');
+    return null;
+  }
+
+  try {
+    const response = await fetchWithTimeout(
+      `https://graph.instagram.com/v26.0/${senderId}?fields=name,username&access_token=${process.env.INSTAGRAM_ACCESS_TOKEN}`,
+      { method: 'GET' },
+      8000
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error('Instagram profile lookup failed:', JSON.stringify(data));
+      return null;
+    }
+
+    // Prefer their display name; fall back to username if name isn't set.
+    return data.name || data.username || null;
+  } catch (err) {
+    console.error('Instagram profile lookup threw:', err.message);
+    return null;
   }
 }
 
@@ -61,10 +100,33 @@ app.post('/webhook', async function (req, res) {
     return res.sendStatus(401);
   }
 
-  const name = req.body.name;
-  const message = req.body.message;
-  const email = req.body.email || null;
-  const platform = req.body.platform || 'Unknown';
+  // Real Instagram webhook events arrive as a nested payload shaped like:
+  //   { object: 'instagram', entry: [ { messaging: [ { sender, message: { text } } ] } ] }
+  // Your own curl tests send a flat shape instead: { name, message, email, platform }.
+  // This parses whichever shape actually arrived so both keep working.
+  let name, message, email, platform;
+
+  if (req.body.object === 'instagram' && Array.isArray(req.body.entry)) {
+    const messagingEvent = req.body.entry?.[0]?.messaging?.[0];
+    const senderId = messagingEvent?.sender?.id;
+    const text = messagingEvent?.message?.text;
+
+    // Look up the sender's real name/username via the Graph API. Falls
+    // back to a placeholder using their raw ID if the lookup fails for
+    // any reason (missing token, API error, etc.) so a lead is never lost
+    // just because we couldn't get their name.
+    const lookedUpName = senderId ? await getInstagramSenderName(senderId) : null;
+    name = lookedUpName || (senderId ? `Instagram user ${senderId}` : null);
+    message = text || null;
+    email = null;
+    platform = 'Instagram';
+  } else {
+    // Flat shape - curl tests, or any other source sending simple JSON.
+    name = req.body.name;
+    message = req.body.message;
+    email = req.body.email || null;
+    platform = req.body.platform || 'Unknown';
+  }
 
   if (!name || !message) {
     console.error('Rejected request - missing required fields (name/message)');
@@ -158,7 +220,16 @@ async function processLeadInBackground(leadId, name, message, email, platform) {
       break;
     } catch (err) {
       console.error(`Gemini call threw (attempt ${attempt}):`, err.message);
-      break; // includes timeout aborts from fetchWithTimeout
+      // A timeout/abort is just as retryable as a 503 - the request never
+      // even got a response back, so there's no reason to assume it'll
+      // fail the same way again. Bad-key/invalid-request errors show up
+      // in the response body above, not as a thrown exception, so it's
+      // safe to always retry here.
+      if (attempt < 3) {
+        await new Promise(r => setTimeout(r, attempt * 1000)); // wait 1s, then 2s
+        continue;
+      }
+      break;
     }
   }
 
@@ -185,31 +256,15 @@ async function processLeadInBackground(leadId, name, message, email, platform) {
       console.log('Score saved back to Supabase for lead:', leadId);
     }
 
-    // Step 4: Email yourself the result (via Resend's HTTP API)
-    const emailResponse = await fetchWithTimeout(
-      'https://api.resend.com/emails',
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          from: MAIL_FROM,
-          to: process.env.MAIL_TO,
-          subject: `New lead scored: ${name} (${platform})`,
-          text: `${name} just got scored.\n\nPlatform: ${platform}\nEmail: ${email || 'not provided'}\nMessage: ${message}\n\nAI Score: ${scoreText === null ? 'unavailable (Gemini scoring failed)' : scoreText}`
-        })
-      },
-      10000
-    );
+    // Step 4: Email yourself the result
+    await transporter.sendMail({
+      from: process.env.GMAIL_USER,
+      to: process.env.GMAIL_USER,
+      subject: `New lead scored: ${name} (${platform})`,
+      text: `${name} just got scored.\n\nPlatform: ${platform}\nEmail: ${email || 'not provided'}\nMessage: ${message}\n\nAI Score: ${scoreText === null ? 'unavailable (Gemini scoring failed)' : scoreText}`
+    });
 
-    const emailResult = await emailResponse.json();
-    if (!emailResponse.ok) {
-      console.error('Resend API error for lead', leadId, '-', JSON.stringify(emailResult));
-    } else {
-      console.log('Email sent for lead:', leadId, '- Resend id:', emailResult.id);
-    }
+    console.log('Email sent for lead:', leadId);
   } catch (err) {
     // Scoring or emailing failed, but the lead itself is already saved,
     // so we just log the problem - there's no request left to respond to.
