@@ -8,7 +8,9 @@ const app = express();
 // instead of SMTP. Render blocks outbound SMTP ports (25/465/587), so
 // nodemailer/Gmail could never actually connect from here.
 //   RESEND_API_KEY - from the Resend dashboard (starts with "re_")
-//   MAIL_TO        - the address that receives the lead alerts
+//   MAIL_TO        - fallback recipient for the flat/curl-test path only.
+//                     Real Instagram leads use the owning tenant's
+//                     notification_email instead (see tenants table).
 //   MAIL_FROM      - optional; a verified Resend sender. Defaults to
 //                    onboarding@resend.dev, which can only deliver to the
 //                    email you signed up to Resend with.
@@ -21,9 +23,7 @@ app.use(function (req, res, next) {
 
 // We need the RAW request body (not the parsed object) to verify Meta's
 // signature below - HMAC has to be computed over the exact bytes Meta
-// sent, before JSON.parse touches them. express.json()'s `verify` option
-// lets us stash that raw buffer on the request as a side effect of
-// parsing, so both the raw bytes and the parsed body are available.
+// sent, before JSON.parse touches them.
 app.use(express.json({
   verify: function (req, res, buf) {
     req.rawBody = buf;
@@ -46,14 +46,11 @@ async function fetchWithTimeout(url, options, timeoutMs) {
 // Meta webhook signature verification
 // ---------------------------------------------------------------------------
 
-// Meta signs every real webhook POST with an X-Hub-Signature-256 header:
-// "sha256=<hmac>", where the HMAC is computed over the raw request body
-// using your app's secret as the key. Verifying this is the only way to
-// know a request claiming to be "from Instagram" actually came from Meta
-// and not from anyone who found your URL and forged the same JSON shape.
-//
-// Requires META_APP_SECRET on Render - this is the "Instagram app secret"
-// shown on the API setup page in the Meta dashboard (click "Show").
+// Meta signs every real webhook POST with an X-Hub-Signature-256 header.
+// Verifying this confirms a request claiming to be "from Instagram"
+// actually came from Meta, not from anyone who found your URL.
+// Requires META_APP_SECRET on Render (the "Instagram app secret" shown
+// on the API setup page in the Meta dashboard).
 function isValidMetaSignature(req) {
   if (!process.env.META_APP_SECRET) {
     console.error('META_APP_SECRET not set - cannot verify Meta signature');
@@ -70,8 +67,6 @@ function isValidMetaSignature(req) {
     .update(req.rawBody)
     .digest('hex');
 
-  // timingSafeEqual requires both buffers to be the same length, so check
-  // that first - a length mismatch just means "not equal", not an error.
   const a = Buffer.from(signatureHeader);
   const b = Buffer.from(expected);
   if (a.length !== b.length) return false;
@@ -95,11 +90,10 @@ function supabaseHeaders(extra) {
 // Insert a lead row and return its new id. Throws on any failure; the
 // thrown error carries `.statusCode` so the flat-shape caller can pass a
 // sensible HTTP status back to whoever is waiting.
-async function saveLead({ name, message, email, platform, igMid }) {
+async function saveLead({ name, message, email, platform, igMid, tenantId }) {
   const row = { name, message, email, platform };
-  // Only send ig_mid when the column actually exists, otherwise PostgREST
-  // rejects the whole insert.
   if (persistentDedupeEnabled && igMid) row.ig_mid = igMid;
+  if (tenantId != null) row.tenant_id = tenantId;
 
   let response;
   try {
@@ -110,7 +104,7 @@ async function saveLead({ name, message, email, platform, igMid }) {
         headers: supabaseHeaders({ 'Prefer': 'return=representation' }),
         body: JSON.stringify(row)
       },
-      8000 // 8s timeout
+      8000
     );
   } catch (err) {
     const wrapped = new Error(`Supabase save threw: ${err.message}`);
@@ -138,13 +132,10 @@ async function saveLead({ name, message, email, platform, igMid }) {
   return savedLead[0].id;
 }
 
-// Patch fields onto an existing lead row. Throws on failure.
 async function updateLead(leadId, fields) {
   return patchLeadsWhere(`id=eq.${leadId}`, fields);
 }
 
-// Patch fields onto every lead row matching a PostgREST filter string
-// (e.g. "name=eq.Instagram%20user%20123"). Throws on failure.
 async function patchLeadsWhere(filter, fields) {
   const response = await fetchWithTimeout(
     `${process.env.SUPABASE_URL}/rest/v1/leads_v2?${filter}`,
@@ -161,30 +152,71 @@ async function patchLeadsWhere(filter, fields) {
 }
 
 // ---------------------------------------------------------------------------
+// Tenants (multi-business support)
+// ---------------------------------------------------------------------------
+
+// Which business a message belongs to is determined by `recipient.id` on
+// the webhook event - that's the Instagram-scoped ID of the account that
+// RECEIVED the message, i.e. your customer's connected account, not the
+// sender. We look that ID up in the tenants table to get their own
+// access token and notification email, so every customer's leads use
+// their own credentials, not yours.
+//
+// Cached for 5 minutes so a burst of messages doesn't hit Supabase once
+// per message - tenant config changes rarely, so a short staleness
+// window is a fine tradeoff for far fewer queries.
+const tenantCache = new Map(); // instagramAccountId -> { value: tenant|null, expires }
+const TENANT_CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function getTenantByInstagramAccountId(instagramAccountId) {
+  const cached = tenantCache.get(instagramAccountId);
+  if (cached && cached.expires > Date.now()) return cached.value;
+
+  let tenant = null;
+  try {
+    const response = await fetchWithTimeout(
+      `${process.env.SUPABASE_URL}/rest/v1/tenants?instagram_account_id=eq.${encodeURIComponent(instagramAccountId)}&active=eq.true&select=*&limit=1`,
+      { headers: supabaseHeaders() },
+      8000
+    );
+    if (response.ok) {
+      const rows = await response.json();
+      tenant = rows[0] || null;
+    } else {
+      console.error('Tenant lookup failed:', response.status);
+    }
+  } catch (err) {
+    console.error('Tenant lookup threw:', err.message);
+  }
+
+  tenantCache.set(instagramAccountId, { value: tenant, expires: Date.now() + TENANT_CACHE_TTL_MS });
+  return tenant;
+}
+
+// ---------------------------------------------------------------------------
 // Instagram helpers
 // ---------------------------------------------------------------------------
 
 // Instagram's webhook only gives you the sender's numeric ID, not their
-// name. This looks up their real name/username via the Graph API.
-// Requires INSTAGRAM_ACCESS_TOKEN to be set on Render (the token you
-// generated in "Generate access tokens"). Returns null on any failure -
-// callers should fall back to using the raw ID instead.
+// name. This looks up their real name/username via the Graph API, using
+// the OWNING TENANT's access token (not a global one - each business's
+// token only works for messages sent to THEIR account).
 //
-// Results are cached in memory so repeated messages from the same person
-// don't each trigger a fresh Graph API call: successes for an hour,
-// failures for a few minutes (so a transient error gets retried soon, but
-// a broken token doesn't get hammered on every incoming message).
-const nameCache = new Map(); // senderId -> { value: string|null, expires: number }
-const NAME_CACHE_TTL_MS = 60 * 60 * 1000;      // 1 hour for a resolved name
-const NAME_CACHE_NEG_TTL_MS = 5 * 60 * 1000;   // 5 min for a failed lookup
+// Results are cached in memory: successes for an hour, failures for a
+// few minutes (so a transient error gets retried soon, but a broken
+// token doesn't get hammered on every incoming message).
+const nameCache = new Map(); // `${tenantId}:${senderId}` -> { value, expires }
+const NAME_CACHE_TTL_MS = 60 * 60 * 1000;
+const NAME_CACHE_NEG_TTL_MS = 5 * 60 * 1000;
 const NAME_CACHE_LIMIT = 5000;
 
-async function getInstagramSenderName(senderId) {
-  const cached = nameCache.get(senderId);
+async function getInstagramSenderName(senderId, accessToken, tenantId) {
+  const cacheKey = `${tenantId}:${senderId}`;
+  const cached = nameCache.get(cacheKey);
   if (cached && cached.expires > Date.now()) return cached.value;
 
-  if (!process.env.INSTAGRAM_ACCESS_TOKEN) {
-    console.error('INSTAGRAM_ACCESS_TOKEN not set - cannot look up sender name');
+  if (!accessToken) {
+    console.error('No access token available for tenant', tenantId, '- cannot look up sender name');
     return null;
   }
 
@@ -192,7 +224,7 @@ async function getInstagramSenderName(senderId) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const response = await fetchWithTimeout(
-        `https://graph.instagram.com/v26.0/${senderId}?fields=name,username&access_token=${process.env.INSTAGRAM_ACCESS_TOKEN}`,
+        `https://graph.instagram.com/v26.0/${senderId}?fields=name,username&access_token=${accessToken}`,
         { method: 'GET' },
         8000
       );
@@ -200,14 +232,11 @@ async function getInstagramSenderName(senderId) {
       const data = await response.json();
 
       if (response.ok) {
-        // Prefer their display name; fall back to username if name isn't set.
         resolved = data.name || data.username || null;
         break;
       }
 
       console.error(`Instagram profile lookup failed (attempt ${attempt}):`, JSON.stringify(data));
-      // 4xx (bad token, unknown user, permissions) won't fix itself on a
-      // retry - only a 429/5xx is worth trying again.
       if (response.status < 500 && response.status !== 429) break;
     } catch (err) {
       console.error(`Instagram profile lookup threw (attempt ${attempt}):`, err.message);
@@ -215,7 +244,7 @@ async function getInstagramSenderName(senderId) {
     if (attempt < 2) await new Promise(r => setTimeout(r, 1000));
   }
 
-  nameCache.set(senderId, {
+  nameCache.set(cacheKey, {
     value: resolved,
     expires: Date.now() + (resolved ? NAME_CACHE_TTL_MS : NAME_CACHE_NEG_TTL_MS)
   });
@@ -225,21 +254,8 @@ async function getInstagramSenderName(senderId) {
   return resolved;
 }
 
-// Meta delivers webhooks "at least once" - the same event can arrive
-// several times (retries, or just Meta being Meta). We dedupe on the
-// message id (mid) so a redelivery doesn't create a duplicate lead /
-// Gemini call / email.
-//
-// Two layers:
-//   1. An in-memory set - fast, but resets on restart/redeploy (which on
-//      Render's free tier happens every time the service spins down).
-//   2. A check against Supabase (leads_v2.ig_mid) - survives restarts and
-//      works across instances. Enabled automatically at boot IF that
-//      column exists; otherwise we log a warning and rely on layer 1 only.
-//
-// For true idempotency under a burst of identical redeliveries, add a
-// UNIQUE index on leads_v2.ig_mid - saveLead() turns the resulting 409
-// into a silent skip.
+// Meta delivers webhooks "at least once" - dedupe on message id (mid) so
+// a redelivery doesn't create a duplicate lead / Gemini call / email.
 const seenMessageIds = new Set();
 const SEEN_MESSAGE_LIMIT = 5000;
 let persistentDedupeEnabled = false;
@@ -253,7 +269,7 @@ function rememberMid(mid) {
 }
 
 async function isDuplicateMid(mid) {
-  if (!mid) return false; // can't dedupe without an id - let it through
+  if (!mid) return false;
   if (seenMessageIds.has(mid)) return true;
 
   if (persistentDedupeEnabled) {
@@ -278,9 +294,6 @@ async function isDuplicateMid(mid) {
   return false;
 }
 
-// Detect once, at boot, whether leads_v2 has the ig_mid column so we know
-// whether persistent dedupe is available (and whether saveLead should
-// include ig_mid in inserts at all).
 async function detectPersistentDedupe() {
   try {
     const response = await fetchWithTimeout(
@@ -292,7 +305,7 @@ async function detectPersistentDedupe() {
     if (response.ok) {
       console.log('Persistent dedupe ENABLED (leads_v2.ig_mid present)');
     } else {
-      console.warn('leads_v2.ig_mid not found - dedupe is in-memory only. To make it survive restarts:\n  alter table leads_v2 add column ig_mid text;\n  create unique index leads_v2_ig_mid_key on leads_v2 (ig_mid);');
+      console.warn('leads_v2.ig_mid not found - dedupe is in-memory only.');
     }
   } catch (err) {
     console.warn('Could not probe leads_v2.ig_mid - dedupe is in-memory only:', err.message);
@@ -301,18 +314,15 @@ async function detectPersistentDedupe() {
 
 // Pull the inbound messages out of an Instagram webhook payload. A single
 // POST can carry multiple entries, each with multiple messaging events.
-// We skip:
-//   - message.is_echo  -> a message YOUR account sent (e.g. your reply)
-//   - no message       -> reactions, read receipts, postbacks (logged, not dropped silently)
-// Non-text messages (voice notes, images, shares) ARE kept - we can't
-// score their content, but "someone with no name sent you a voice note
-// about pricing" is still a lead you need to see.
+// Each message also carries `recipientId` - the tenant's account ID -
+// so the caller knows which business it belongs to.
 function extractInstagramMessages(body) {
   const messages = [];
 
   for (const entry of body.entry || []) {
     for (const event of entry.messaging || []) {
       const msg = event.message;
+      const recipientId = event.recipient && event.recipient.id;
 
       if (!msg) {
         const kind = event.reaction ? 'reaction'
@@ -325,7 +335,7 @@ function extractInstagramMessages(body) {
       if (msg.is_echo) continue;
 
       const senderId = event.sender && event.sender.id;
-      if (!senderId) continue;
+      if (!senderId || !recipientId) continue;
 
       let text = msg.text;
       if (!text) {
@@ -334,7 +344,7 @@ function extractInstagramMessages(body) {
         console.log('Instagram non-text message from', senderId, '- attachment types:', kinds || 'unknown');
       }
 
-      messages.push({ senderId, mid: msg.mid, text });
+      messages.push({ senderId, recipientId, mid: msg.mid, text });
     }
   }
 
@@ -343,16 +353,24 @@ function extractInstagramMessages(body) {
 
 // Handle one inbound Instagram message end to end. Runs in the background
 // (after we've already 200'd Meta), so it's free to take its time.
-async function handleInstagramLead({ senderId, mid, text }) {
+async function handleInstagramLead({ senderId, recipientId, mid, text }) {
   if (await isDuplicateMid(mid)) {
     console.log('Skipping duplicate Instagram message:', mid);
     return;
   }
 
+  // Figure out which tenant (business) this message belongs to, using
+  // whichever account RECEIVED it. Every downstream step - the sender
+  // name lookup, the notification email - uses THIS tenant's own
+  // credentials, never a global one.
+  const tenant = await getTenantByInstagramAccountId(recipientId);
+  if (!tenant) {
+    console.error('No active tenant found for Instagram account', recipientId, '- message dropped. Add a row to the tenants table to fix this.');
+    return;
+  }
+
   const placeholderName = `Instagram user ${senderId}`;
 
-  // Save the lead first with a placeholder name - the profile lookup can
-  // take several seconds and we never want to lose a lead waiting on it.
   let leadId;
   try {
     leadId = await saveLead({
@@ -360,7 +378,8 @@ async function handleInstagramLead({ senderId, mid, text }) {
       message: text,
       email: null,
       platform: 'Instagram',
-      igMid: mid
+      igMid: mid,
+      tenantId: tenant.id
     });
   } catch (err) {
     if (err.duplicate) {
@@ -373,17 +392,16 @@ async function handleInstagramLead({ senderId, mid, text }) {
   }
   rememberMid(mid);
 
-  // Resolve their real name. If it works, backfill it onto every row from
-  // this sender that's still showing the placeholder - that repairs any
-  // earlier message whose lookup had failed, so a name failure is never
-  // permanent as long as they message again.
   let name = placeholderName;
-  const realName = await getInstagramSenderName(senderId);
+  const realName = await getInstagramSenderName(senderId, tenant.instagram_access_token, tenant.id);
   if (realName) {
     name = realName;
     try {
-      await patchLeadsWhere(`name=eq.${encodeURIComponent(placeholderName)}`, { name: realName });
-      console.log('Backfilled name for sender', senderId, '->', realName);
+      await patchLeadsWhere(
+        `name=eq.${encodeURIComponent(placeholderName)}&tenant_id=eq.${tenant.id}`,
+        { name: realName }
+      );
+      console.log('Backfilled name for sender', senderId, '(tenant', tenant.id, ') ->', realName);
     } catch (err) {
       console.error('Failed to backfill name for lead', leadId, '-', err.message);
     }
@@ -391,15 +409,13 @@ async function handleInstagramLead({ senderId, mid, text }) {
     console.warn('No name for lead', leadId, '- left as placeholder, will retry on their next message');
   }
 
-  await processLeadInBackground(leadId, name, text, null, 'Instagram');
+  await processLeadInBackground(leadId, name, text, null, 'Instagram', tenant.notification_email);
 }
 
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
 
-// Meta calls this with a GET request to verify you control this URL,
-// before it will send any real webhook events (POST requests) to it.
 app.get('/webhook', function (req, res) {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -417,35 +433,21 @@ app.get('/webhook', function (req, res) {
 app.post('/webhook', async function (req, res) {
   console.log('New message received:', JSON.stringify(req.body));
 
-  // Basic shared-secret check so random people can't POST to this endpoint
-  // and trigger real Gemini calls (which cost money) and emails to you.
-  // Set WEBHOOK_SECRET on Render, and send the same value as this header
-  // from whatever is calling this webhook.
-  //
-  // Note: real Instagram webhooks won't send this header - Meta signs its
-  // requests with X-Hub-Signature-256 instead, verified separately below.
   const hasSecret = !!process.env.WEBHOOK_SECRET;
   const secretOk = req.headers['x-webhook-secret'] === process.env.WEBHOOK_SECRET;
 
   // ----- Real Instagram webhook payload -----
   if (req.body && req.body.object === 'instagram' && Array.isArray(req.body.entry)) {
-    // Verify this actually came from Meta before doing anything with it.
-    // Without this, anyone who discovers this URL could POST a fake
-    // Instagram-shaped payload and it would be processed as a real lead.
     if (!isValidMetaSignature(req)) {
       console.error('Rejected Instagram payload - invalid or missing X-Hub-Signature-256');
       return res.sendStatus(401);
     }
 
-    // ALWAYS ack Meta with a 200, immediately. A non-2xx (or a slow
-    // response) just makes Meta redeliver the same event again and again.
-    // Events we can't act on are filtered out silently below.
     res.sendStatus(200);
 
     const messages = extractInstagramMessages(req.body);
     console.log(`Instagram payload: ${messages.length} inbound message(s)`);
 
-    // Fire and forget - the response is already sent.
     for (const msg of messages) {
       handleInstagramLead(msg).catch(function (err) {
         console.error('handleInstagramLead crashed for', msg.senderId, '-', err.message);
@@ -455,8 +457,8 @@ app.post('/webhook', async function (req, res) {
   }
 
   // ----- Flat shape: curl tests / other simple JSON sources -----
-  // These callers ARE waiting on the response, so they get a real status
-  // and we do enforce the shared secret.
+  // Uses MAIL_TO directly (no tenant lookup) - this path is for your own
+  // testing, not real customer traffic.
   if (hasSecret && !secretOk) {
     console.error('Rejected request - missing or wrong x-webhook-secret header');
     return res.sendStatus(401);
@@ -472,7 +474,6 @@ app.post('/webhook', async function (req, res) {
     return res.status(400).send('Missing required fields: name and message');
   }
 
-  // Step 1: Save to Supabase. This is the ONLY thing the sender waits on.
   let leadId;
   try {
     leadId = await saveLead({ name, message, email, platform });
@@ -481,24 +482,16 @@ app.post('/webhook', async function (req, res) {
     return res.status(err.statusCode || 500).send('Failed to save lead');
   }
 
-  // Respond immediately - the lead is safely saved, so whoever/whatever
-  // sent this webhook doesn't need to wait on Gemini or Resend, which can
-  // take several seconds (especially with retries). This also protects
-  // against webhook providers that time out and re-send if you're slow.
   res.status(200).send('OK');
 
-  // Everything below runs in the background, AFTER the response above has
-  // already gone out. Nothing here can affect what the sender sees.
-  processLeadInBackground(leadId, name, message, email, platform).catch(function (err) {
+  processLeadInBackground(leadId, name, message, email, platform, process.env.MAIL_TO).catch(function (err) {
     console.error('processLeadInBackground crashed for lead', leadId, '-', err.message);
   });
 });
 
-async function processLeadInBackground(leadId, name, message, email, platform) {
+async function processLeadInBackground(leadId, name, message, email, platform, notificationEmail) {
   let scoreText = null;
 
-  // Step 2: Score with Gemini (with retry - Gemini occasionally returns a
-  // temporary 503 "high demand" error, which usually clears within seconds)
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const geminiResponse = await fetchWithTimeout(
@@ -517,17 +510,15 @@ async function processLeadInBackground(leadId, name, message, email, platform) {
             }]
           })
         },
-        10000 // 10s timeout per attempt
+        10000
       );
 
       const geminiData = await geminiResponse.json();
 
       if (!geminiResponse.ok || !geminiData.candidates || !geminiData.candidates[0]) {
         console.error(`Gemini API error (attempt ${attempt}):`, JSON.stringify(geminiData));
-        // 503 = temporary overload on Google's side, worth retrying.
-        // Anything else (bad key, invalid model, etc.) won't fix itself.
         if (geminiData?.error?.code === 503 && attempt < 3) {
-          await new Promise(r => setTimeout(r, attempt * 1000)); // wait 1s, then 2s
+          await new Promise(r => setTimeout(r, attempt * 1000));
           continue;
         }
         break;
@@ -538,13 +529,8 @@ async function processLeadInBackground(leadId, name, message, email, platform) {
       break;
     } catch (err) {
       console.error(`Gemini call threw (attempt ${attempt}):`, err.message);
-      // A timeout/abort is just as retryable as a 503 - the request never
-      // even got a response back, so there's no reason to assume it'll
-      // fail the same way again. Bad-key/invalid-request errors show up
-      // in the response body above, not as a thrown exception, so it's
-      // safe to always retry here.
       if (attempt < 3) {
-        await new Promise(r => setTimeout(r, attempt * 1000)); // wait 1s, then 2s
+        await new Promise(r => setTimeout(r, attempt * 1000));
         continue;
       }
       break;
@@ -552,9 +538,6 @@ async function processLeadInBackground(leadId, name, message, email, platform) {
   }
 
   try {
-    // Step 3: Save the score back to Supabase, only if we got one.
-    // If scoring failed we still email you - the score is a nice-to-have,
-    // the lead notification is the point.
     if (scoreText === null) {
       console.error('No Gemini score for lead', leadId, '- emailing anyway without a score');
     } else {
@@ -562,7 +545,6 @@ async function processLeadInBackground(leadId, name, message, email, platform) {
       console.log('Score saved back to Supabase for lead:', leadId);
     }
 
-    // Step 4: Email yourself the result (via Resend's HTTP API)
     const emailResponse = await fetchWithTimeout(
       'https://api.resend.com/emails',
       {
@@ -573,7 +555,7 @@ async function processLeadInBackground(leadId, name, message, email, platform) {
         },
         body: JSON.stringify({
           from: MAIL_FROM,
-          to: process.env.MAIL_TO,
+          to: notificationEmail,
           subject: `New lead scored: ${name} (${platform})`,
           text: `${name} just got scored.\n\nPlatform: ${platform}\nEmail: ${email || 'not provided'}\nMessage: ${message}\n\nAI Score: ${scoreText === null ? 'unavailable (Gemini scoring failed)' : scoreText}`
         })
@@ -588,8 +570,6 @@ async function processLeadInBackground(leadId, name, message, email, platform) {
       console.log('Email sent for lead:', leadId, '- Resend id:', emailResult.id);
     }
   } catch (err) {
-    // Scoring or emailing failed, but the lead itself is already saved,
-    // so we just log the problem - there's no request left to respond to.
     console.error('Post-save processing failed for lead', leadId, '-', err.message);
   }
 }
