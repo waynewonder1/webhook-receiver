@@ -210,6 +210,48 @@ const NAME_CACHE_TTL_MS = 60 * 60 * 1000;
 const NAME_CACHE_NEG_TTL_MS = 5 * 60 * 1000;
 const NAME_CACHE_LIMIT = 5000;
 
+// Sends an automated text reply to whoever just messaged the tenant's
+// Instagram account. Fire-and-forget from the caller's point of view -
+// a failed reply is logged but never blocks saving the lead or scoring
+// it, since the lead itself matters more than the acknowledgment.
+//
+// igId is the TENANT's own Instagram account ID (the business account
+// sending the reply) - the endpoint is /<IG_ID>/messages, and the
+// recipient is the person who messaged in (senderId).
+async function sendInstagramAutoReply(igId, senderId, text, accessToken) {
+  if (!accessToken) {
+    console.error('No access token available - cannot send auto-reply to', senderId);
+    return;
+  }
+
+  try {
+    const response = await fetchWithTimeout(
+      `https://graph.instagram.com/v26.0/${igId}/messages`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          recipient: { id: senderId },
+          message: { text }
+        })
+      },
+      8000
+    );
+
+    const data = await response.json();
+    if (!response.ok) {
+      console.error('Auto-reply failed for', senderId, '-', JSON.stringify(data));
+    } else {
+      console.log('Auto-reply sent to', senderId, '- message id:', data.message_id);
+    }
+  } catch (err) {
+    console.error('Auto-reply threw for', senderId, '-', err.message);
+  }
+}
+
 async function getInstagramSenderName(senderId, accessToken, tenantId) {
   const cacheKey = `${tenantId}:${senderId}`;
   const cached = nameCache.get(cacheKey);
@@ -391,6 +433,15 @@ async function handleInstagramLead({ senderId, recipientId, mid, text }) {
     return;
   }
   rememberMid(mid);
+
+  // Send the automated acknowledgment reply right away, in parallel with
+  // everything below - the person messaging in gets an instant response
+  // instead of waiting on Gemini (which can be slow, or rate-limited).
+  // Uses the tenant's own default reply text if they've set one,
+  // otherwise a generic fallback.
+  const replyText = tenant.auto_reply_message ||
+    "Thanks for reaching out! We've received your message and will get back to you shortly.";
+  sendInstagramAutoReply(tenant.instagram_account_id, senderId, replyText, tenant.instagram_access_token);
 
   let name = placeholderName;
   const realName = await getInstagramSenderName(senderId, tenant.instagram_access_token, tenant.id);
