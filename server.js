@@ -434,12 +434,24 @@ async function handleInstagramLead({ senderId, recipientId, mid, text }) {
   }
   rememberMid(mid);
 
-  // Send the automated acknowledgment reply right away, in parallel with
-  // everything below - the person messaging in gets an instant response
-  // instead of waiting on Gemini (which can be slow, or rate-limited).
-  // Uses the tenant's own default reply text if they've set one,
-  // otherwise a generic fallback.
-  const replyText = tenant.auto_reply_message ||
+  // Ask Gemini to both assess this lead AND draft a real, specific reply
+  // grounded in the tenant's knowledge_base (products/services/pricing).
+  // This costs a few seconds of delay before the customer sees anything -
+  // worth it for a reply that actually engages with what they asked,
+  // instead of an instant but generic "thanks for reaching out". If this
+  // fails entirely, fall back to the tenant's static default, then a
+  // generic line, so a Gemini outage never leaves someone unanswered.
+  const assessment = await assessLead({
+    name: placeholderName,
+    message: text,
+    platform: 'Instagram',
+    businessName: tenant.business_name || tenant.name || null,
+    businessContext: tenant.business_description || null,
+    knowledgeBase: tenant.knowledge_base || null
+  });
+
+  const replyText = (assessment && assessment.customer_reply) ||
+    tenant.auto_reply_message ||
     "Thanks for reaching out! We've received your message and will get back to you shortly.";
   sendInstagramAutoReply(tenant.instagram_account_id, senderId, replyText, tenant.instagram_access_token);
 
@@ -460,7 +472,11 @@ async function handleInstagramLead({ senderId, recipientId, mid, text }) {
     console.warn('No name for lead', leadId, '- left as placeholder, will retry on their next message');
   }
 
-  await processLeadInBackground(leadId, name, text, null, 'Instagram', tenant.notification_email);
+  await processLeadInBackground(
+    leadId, name, text, null, 'Instagram', tenant.notification_email,
+    { name: tenant.business_name || tenant.name || null, context: tenant.business_description || null },
+    assessment
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -540,12 +556,56 @@ app.post('/webhook', async function (req, res) {
   });
 });
 
-async function processLeadInBackground(leadId, name, message, email, platform, notificationEmail) {
-  let scoreText = null;
+// Ask Gemini to assess the lead AND draft the actual reply we send back to
+// the customer on Instagram - one call does both jobs, grounded in the
+// tenant's own knowledge_base (products/services/pricing/policies) so the
+// reply can be specific instead of "thanks for reaching out". Returns:
+//   { score, category, reasoning, recommended_action, customer_reply, raw }
+// `score` is 1-10, or null if we couldn't get a usable answer. `raw` is
+// the model's original text, kept as a fallback for the internal email.
+//
+// Guardrail: the prompt explicitly forbids inventing prices/products that
+// aren't in the knowledge base, because customer_reply gets sent to a real
+// person with NO human review in between. If the knowledge base is empty,
+// the model is told to be honest about not having details yet rather than
+// making something up.
+async function assessLead({ name, message, platform, businessName, businessContext, knowledgeBase }) {
+  const persona = businessName
+    ? `You are a real, knowledgeable staff member replying to DMs for "${businessName}".` +
+      (businessContext ? ` About the business: ${businessContext}` : '')
+    : 'You are a sales assistant helping a small business owner triage inbound DMs.';
+
+  const kb = (knowledgeBase || '').trim();
+
+  const prompt = `${persona}
+
+Here is everything you're allowed to know about the business's products, services, pricing, and policies. Treat it as the ONLY source of truth - never invent a price, product, or policy that isn't in here:
+"""
+${kb || '(no product/pricing info has been provided yet)'}
+"""
+
+A person named "${name}" sent this message via ${platform}:
+"""
+${message}
+"""
+
+Do two things:
+
+1. Assess this as a sales lead for the internal team (they will NOT see your reply to the customer, only this assessment).
+2. Draft the actual reply to send back to the customer right now, as a real conversation - not a form letter. Address what they specifically asked. If the knowledge base above answers their question (a price, a product detail, availability, a policy), state it directly and confidently. If it does NOT contain the answer, say so honestly and let them know a team member will follow up with the specifics - do NOT guess or make up numbers. Keep it warm, 2-5 sentences.
+
+Reply with ONLY a JSON object - no markdown, no code fences - in exactly this shape:
+{
+  "score": <integer 1-10 for buying intent; 1 = spam/bot/irrelevant, 10 = ready to buy now>,
+  "category": "<one of: hot, warm, cold, spam>",
+  "reasoning": "<1-2 sentences for the internal team, specific to THIS message>",
+  "recommended_action": "<the single most useful next step for the owner, concrete and short>",
+  "customer_reply": "<the message to send back to the customer, per the rules above>"
+}`;
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const geminiResponse = await fetchWithTimeout(
+      const response = await fetchWithTimeout(
         'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
         {
           method: 'POST',
@@ -554,30 +614,44 @@ async function processLeadInBackground(leadId, name, message, email, platform, n
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({
-            contents: [{
-              parts: [{
-                text: `Score this lead 1-10 on buying intent. Name: ${name}. Platform: ${platform}. Message: ${message}`
-              }]
-            }]
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.2, responseMimeType: 'application/json' }
           })
         },
         10000
       );
 
-      const geminiData = await geminiResponse.json();
+      const data = await response.json();
 
-      if (!geminiResponse.ok || !geminiData.candidates || !geminiData.candidates[0]) {
-        console.error(`Gemini API error (attempt ${attempt}):`, JSON.stringify(geminiData));
-        if (geminiData?.error?.code === 503 && attempt < 3) {
+      if (!response.ok || !data.candidates || !data.candidates[0]) {
+        console.error(`Gemini API error (attempt ${attempt}):`, JSON.stringify(data));
+        if (data?.error?.code === 503 && attempt < 3) {
           await new Promise(r => setTimeout(r, attempt * 1000));
           continue;
         }
         break;
       }
 
-      scoreText = geminiData.candidates[0].content.parts[0].text;
-      console.log('Gemini score:', scoreText);
-      break;
+      const raw = data.candidates[0].content.parts[0].text;
+      console.log('Gemini assessment:', raw);
+
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (e) {
+        console.error('Gemini returned non-JSON - using raw text:', e.message);
+        return { score: null, category: null, reasoning: null, recommended_action: null, customer_reply: null, raw };
+      }
+
+      const n = Number(parsed.score);
+      return {
+        score: Number.isFinite(n) ? Math.max(1, Math.min(10, Math.round(n))) : null,
+        category: parsed.category || null,
+        reasoning: parsed.reasoning || null,
+        recommended_action: parsed.recommended_action || null,
+        customer_reply: parsed.customer_reply || null,
+        raw
+      };
     } catch (err) {
       console.error(`Gemini call threw (attempt ${attempt}):`, err.message);
       if (attempt < 3) {
@@ -588,12 +662,89 @@ async function processLeadInBackground(leadId, name, message, email, platform, n
     }
   }
 
+  return null; // total failure - lead still gets emailed, just without a score
+}
+
+const CATEGORY_EMOJI = { hot: '🔥', warm: '🌤️', cold: '❄️', spam: '🚫' };
+
+function buildLeadEmail({ name, message, email, platform, assessment }) {
+  const lines = [];
+
+  if (assessment && assessment.score != null) {
+    const cat = assessment.category ? assessment.category.toUpperCase() : 'UNCATEGORIZED';
+    lines.push(`SCORE: ${assessment.score}/10   (${cat})`);
+    lines.push('');
+    if (assessment.reasoning) lines.push(`Why:  ${assessment.reasoning}`);
+    if (assessment.recommended_action) lines.push(`Next: ${assessment.recommended_action}`);
+    if (assessment.customer_reply) {
+      lines.push('');
+      lines.push('What we auto-replied to them on Instagram:');
+      lines.push(`  ${assessment.customer_reply}`);
+    }
+  } else if (assessment && assessment.raw) {
+    lines.push(assessment.raw);
+  } else {
+    lines.push('AI scoring failed - review this lead manually.');
+  }
+
+  lines.push('');
+  lines.push('----------------------------------------');
+  lines.push(`From:     ${name}`);
+  lines.push(`Platform: ${platform}`);
+  lines.push(`Email:    ${email || 'not provided'}`);
+  lines.push('');
+  lines.push('Their message:');
+  lines.push(message);
+
+  return lines.join('\n');
+}
+
+// `precomputedAssessment` lets a caller that already ran assessLead() (the
+// Instagram flow does, so it can send the customer_reply immediately)
+// skip paying for a second Gemini call here.
+async function processLeadInBackground(leadId, name, message, email, platform, notificationEmail, business, precomputedAssessment) {
+  const assessment = precomputedAssessment !== undefined
+    ? precomputedAssessment
+    : await assessLead({
+        name,
+        message,
+        platform,
+        businessName: business && business.name,
+        businessContext: business && business.context,
+        knowledgeBase: business && business.knowledgeBase
+      });
+
   try {
-    if (scoreText === null) {
-      console.error('No Gemini score for lead', leadId, '- emailing anyway without a score');
-    } else {
-      await updateLead(leadId, { ai_score: scoreText });
-      console.log('Score saved back to Supabase for lead:', leadId);
+    if (!assessment) {
+      console.error('No Gemini assessment for lead', leadId, '- emailing anyway without a score');
+    } else if (assessment.score != null) {
+      await updateLead(leadId, { ai_score: String(assessment.score) });
+      console.log('Score saved back to Supabase for lead:', leadId, '- score', assessment.score);
+    }
+
+    // While testing (no verified domain), Resend's shared sender only
+    // delivers to your own Resend-account address. Setting
+    // NOTIFY_OVERRIDE_EMAIL routes EVERY lead email there instead of the
+    // tenant's real address, so you still see all leads during testing.
+    // The intended tenant recipient is shown in the subject and body.
+    // Remove this env var once you've verified a domain.
+    const override = process.env.NOTIFY_OVERRIDE_EMAIL || null;
+    const intendedRecipient = notificationEmail;
+    const actualRecipient = override || notificationEmail;
+
+    if (!actualRecipient) {
+      console.error('No recipient for lead', leadId, '- skipping email. Set NOTIFY_OVERRIDE_EMAIL / MAIL_TO / the tenant\'s notification_email.');
+      return;
+    }
+
+    const businessLabel = business && business.name ? `[${business.name}] ` : '';
+    const emoji = assessment && assessment.category ? (CATEGORY_EMOJI[assessment.category] || '') : '';
+    const scoreTag = assessment && assessment.score != null ? ` (${assessment.score}/10)` : '';
+    const subject = `${businessLabel}${emoji ? emoji + ' ' : ''}New ${platform} lead: ${name}${scoreTag}`.trim();
+
+    let text = buildLeadEmail({ name, message, email, platform, assessment });
+    if (override && intendedRecipient && override !== intendedRecipient) {
+      text = `(Testing mode - this would normally go to ${intendedRecipient})\n\n${text}`;
     }
 
     const emailResponse = await fetchWithTimeout(
@@ -604,12 +755,7 @@ async function processLeadInBackground(leadId, name, message, email, platform, n
           'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({
-          from: MAIL_FROM,
-          to: notificationEmail,
-          subject: `New lead scored: ${name} (${platform})`,
-          text: `${name} just got scored.\n\nPlatform: ${platform}\nEmail: ${email || 'not provided'}\nMessage: ${message}\n\nAI Score: ${scoreText === null ? 'unavailable (Gemini scoring failed)' : scoreText}`
-        })
+        body: JSON.stringify({ from: MAIL_FROM, to: actualRecipient, subject, text })
       },
       10000
     );
@@ -618,7 +764,12 @@ async function processLeadInBackground(leadId, name, message, email, platform, n
     if (!emailResponse.ok) {
       console.error('Resend API error for lead', leadId, '-', JSON.stringify(emailResult));
     } else {
-      console.log('Email sent for lead:', leadId, '- Resend id:', emailResult.id);
+      console.log('Email accepted by Resend for lead:', leadId, '- id:', emailResult.id, '- to:', actualRecipient);
+      // The shared onboarding@resend.dev sender is accepted (200) but only
+      // actually delivered to the Resend account owner's own address.
+      if (MAIL_FROM === 'onboarding@resend.dev' && !override) {
+        console.warn('NOTE: MAIL_FROM is onboarding@resend.dev - Resend will only DELIVER this if', actualRecipient, 'is your Resend signup email. Set NOTIFY_OVERRIDE_EMAIL for testing, or verify a domain for production.');
+      }
     }
   } catch (err) {
     console.error('Post-save processing failed for lead', leadId, '-', err.message);
