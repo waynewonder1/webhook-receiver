@@ -24,7 +24,7 @@ function TenantCard({ tenant, onSaved }) {
     setSaving(true);
     setStatus(null);
 
-    const updates = {};
+    const updates = { active: !!draft.active };
     for (const { key } of EDITABLE_FIELDS) updates[key] = draft[key];
 
     const { error } = await supabase.from('tenants').update(updates).eq('id', tenant.id);
@@ -34,7 +34,8 @@ function TenantCard({ tenant, onSaved }) {
     if (!error) onSaved(draft);
   }
 
-  const hasChanges = EDITABLE_FIELDS.some(({ key }) => draft[key] !== tenant[key]);
+  const hasChanges =
+    !!draft.active !== !!tenant.active || EDITABLE_FIELDS.some(({ key }) => draft[key] !== tenant[key]);
 
   return (
     <div className="card">
@@ -44,6 +45,17 @@ function TenantCard({ tenant, onSaved }) {
           {tenant.active ? 'Active' : 'Inactive'}
         </span>
         <span>IG account: {tenant.instagram_account_id || 'not set'}</span>
+      </div>
+
+      <div className="field">
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={!!draft.active}
+            onChange={(e) => setField('active', e.target.checked)}
+          />
+          Active - the assistant replies to messages on this account
+        </label>
       </div>
 
       {EDITABLE_FIELDS.map(({ key, label, type }) => (

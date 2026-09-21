@@ -4,34 +4,19 @@ const crypto = require('crypto');
 const express = require('express');
 const app = express();
 
-// Email is sent through Resend's HTTP API (https://api.resend.com, port 443)
-// instead of SMTP. Render blocks outbound SMTP ports (25/465/587), so
-// nodemailer/Gmail could never actually connect from here.
-//   RESEND_API_KEY - from the Resend dashboard (starts with "re_")
-//   MAIL_TO        - fallback recipient for the flat/curl-test path only.
-//                     Real Instagram leads use the owning tenant's
-//                     notification_email instead (see tenants table).
-//   MAIL_FROM      - optional; a verified Resend sender. Defaults to
-//                    onboarding@resend.dev, which can only deliver to the
-//                    email you signed up to Resend with.
 const MAIL_FROM = process.env.MAIL_FROM || 'onboarding@resend.dev';
 
 app.use(function (req, res, next) {
-  console.log('Incoming request:', req.method, req.url);
+  console.log('Incoming request:', req.method, req.path);
   next();
 });
 
-// We need the RAW request body (not the parsed object) to verify Meta's
-// signature below - HMAC has to be computed over the exact bytes Meta
-// sent, before JSON.parse touches them.
 app.use(express.json({
   verify: function (req, res, buf) {
     req.rawBody = buf;
   }
 }));
 
-// Small helper: wraps fetch with a timeout so a hanging request (Gemini,
-// Supabase, anything) fails fast instead of blocking forever.
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -42,15 +27,6 @@ async function fetchWithTimeout(url, options, timeoutMs) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Meta webhook signature verification
-// ---------------------------------------------------------------------------
-
-// Meta signs every real webhook POST with an X-Hub-Signature-256 header.
-// Verifying this confirms a request claiming to be "from Instagram"
-// actually came from Meta, not from anyone who found your URL.
-// Requires META_APP_SECRET on Render (the "Instagram app secret" shown
-// on the API setup page in the Meta dashboard).
 function isValidMetaSignature(req) {
   if (!process.env.META_APP_SECRET) {
     console.error('META_APP_SECRET not set - cannot verify Meta signature');
@@ -74,10 +50,6 @@ function isValidMetaSignature(req) {
   return crypto.timingSafeEqual(a, b);
 }
 
-// ---------------------------------------------------------------------------
-// Supabase helpers
-// ---------------------------------------------------------------------------
-
 function supabaseHeaders(extra) {
   return {
     'apikey': process.env.SUPABASE_KEY,
@@ -86,10 +58,6 @@ function supabaseHeaders(extra) {
     ...extra
   };
 }
-
-// Insert a lead row and return its new id. Throws on any failure; the
-// thrown error carries `.statusCode` so the flat-shape caller can pass a
-// sensible HTTP status back to whoever is waiting.
 async function saveLead({ name, message, email, platform, igMid, tenantId }) {
   const row = { name, message, email, platform };
   if (persistentDedupeEnabled && igMid) row.ig_mid = igMid;
@@ -112,8 +80,6 @@ async function saveLead({ name, message, email, platform, igMid, tenantId }) {
     throw wrapped;
   }
 
-  // 409 = unique-constraint violation on ig_mid: this exact message was
-  // already saved by a concurrent redelivery. Not an error - just skip.
   if (response.status === 409) {
     const dup = new Error('Duplicate ig_mid - lead already saved');
     dup.duplicate = true;
@@ -151,21 +117,7 @@ async function patchLeadsWhere(filter, fields) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Tenants (multi-business support)
-// ---------------------------------------------------------------------------
-
-// Which business a message belongs to is determined by `recipient.id` on
-// the webhook event - that's the Instagram-scoped ID of the account that
-// RECEIVED the message, i.e. your customer's connected account, not the
-// sender. We look that ID up in the tenants table to get their own
-// access token and notification email, so every customer's leads use
-// their own credentials, not yours.
-//
-// Cached for 5 minutes so a burst of messages doesn't hit Supabase once
-// per message - tenant config changes rarely, so a short staleness
-// window is a fine tradeoff for far fewer queries.
-const tenantCache = new Map(); // instagramAccountId -> { value: tenant|null, expires }
+const tenantCache = new Map(); 
 const TENANT_CACHE_TTL_MS = 5 * 60 * 1000;
 
 async function getTenantByInstagramAccountId(instagramAccountId) {
@@ -193,31 +145,11 @@ async function getTenantByInstagramAccountId(instagramAccountId) {
   return tenant;
 }
 
-// ---------------------------------------------------------------------------
-// Instagram helpers
-// ---------------------------------------------------------------------------
-
-// Instagram's webhook only gives you the sender's numeric ID, not their
-// name. This looks up their real name/username via the Graph API, using
-// the OWNING TENANT's access token (not a global one - each business's
-// token only works for messages sent to THEIR account).
-//
-// Results are cached in memory: successes for an hour, failures for a
-// few minutes (so a transient error gets retried soon, but a broken
-// token doesn't get hammered on every incoming message).
-const nameCache = new Map(); // `${tenantId}:${senderId}` -> { value, expires }
+const nameCache = new Map();
 const NAME_CACHE_TTL_MS = 60 * 60 * 1000;
 const NAME_CACHE_NEG_TTL_MS = 5 * 60 * 1000;
 const NAME_CACHE_LIMIT = 5000;
 
-// Sends an automated text reply to whoever just messaged the tenant's
-// Instagram account. Fire-and-forget from the caller's point of view -
-// a failed reply is logged but never blocks saving the lead or scoring
-// it, since the lead itself matters more than the acknowledgment.
-//
-// igId is the TENANT's own Instagram account ID (the business account
-// sending the reply) - the endpoint is /<IG_ID>/messages, and the
-// recipient is the person who messaged in (senderId).
 async function sendInstagramAutoReply(igId, senderId, text, accessToken) {
   if (!accessToken) {
     console.error('No access token available - cannot send auto-reply to', senderId);
@@ -295,9 +227,6 @@ async function getInstagramSenderName(senderId, accessToken, tenantId) {
   }
   return resolved;
 }
-
-// Meta delivers webhooks "at least once" - dedupe on message id (mid) so
-// a redelivery doesn't create a duplicate lead / Gemini call / email.
 const seenMessageIds = new Set();
 const SEEN_MESSAGE_LIMIT = 5000;
 let persistentDedupeEnabled = false;
@@ -354,10 +283,6 @@ async function detectPersistentDedupe() {
   }
 }
 
-// Pull the inbound messages out of an Instagram webhook payload. A single
-// POST can carry multiple entries, each with multiple messaging events.
-// Each message also carries `recipientId` - the tenant's account ID -
-// so the caller knows which business it belongs to.
 function extractInstagramMessages(body) {
   const messages = [];
 
@@ -392,19 +317,12 @@ function extractInstagramMessages(body) {
 
   return messages;
 }
-
-// Handle one inbound Instagram message end to end. Runs in the background
-// (after we've already 200'd Meta), so it's free to take its time.
 async function handleInstagramLead({ senderId, recipientId, mid, text }) {
   if (await isDuplicateMid(mid)) {
     console.log('Skipping duplicate Instagram message:', mid);
     return;
   }
 
-  // Figure out which tenant (business) this message belongs to, using
-  // whichever account RECEIVED it. Every downstream step - the sender
-  // name lookup, the notification email - uses THIS tenant's own
-  // credentials, never a global one.
   const tenant = await getTenantByInstagramAccountId(recipientId);
   if (!tenant) {
     console.error('No active tenant found for Instagram account', recipientId, '- message dropped. Add a row to the tenants table to fix this.');
@@ -434,13 +352,6 @@ async function handleInstagramLead({ senderId, recipientId, mid, text }) {
   }
   rememberMid(mid);
 
-  // Ask Gemini to both assess this lead AND draft a real, specific reply
-  // grounded in the tenant's knowledge_base (products/services/pricing).
-  // This costs a few seconds of delay before the customer sees anything -
-  // worth it for a reply that actually engages with what they asked,
-  // instead of an instant but generic "thanks for reaching out". If this
-  // fails entirely, fall back to the tenant's static default, then a
-  // generic line, so a Gemini outage never leaves someone unanswered.
   const assessment = await assessLead({
     name: placeholderName,
     message: text,
@@ -523,9 +434,6 @@ app.post('/webhook', async function (req, res) {
     return;
   }
 
-  // ----- Flat shape: curl tests / other simple JSON sources -----
-  // Uses MAIL_TO directly (no tenant lookup) - this path is for your own
-  // testing, not real customer traffic.
   if (hasSecret && !secretOk) {
     console.error('Rejected request - missing or wrong x-webhook-secret header');
     return res.sendStatus(401);
@@ -556,19 +464,6 @@ app.post('/webhook', async function (req, res) {
   });
 });
 
-// Ask Gemini to assess the lead AND draft the actual reply we send back to
-// the customer on Instagram - one call does both jobs, grounded in the
-// tenant's own knowledge_base (products/services/pricing/policies) so the
-// reply can be specific instead of "thanks for reaching out". Returns:
-//   { score, category, reasoning, recommended_action, customer_reply, raw }
-// `score` is 1-10, or null if we couldn't get a usable answer. `raw` is
-// the model's original text, kept as a fallback for the internal email.
-//
-// Guardrail: the prompt explicitly forbids inventing prices/products that
-// aren't in the knowledge base, because customer_reply gets sent to a real
-// person with NO human review in between. If the knowledge base is empty,
-// the model is told to be honest about not having details yet rather than
-// making something up.
 async function assessLead({ name, message, platform, businessName, businessContext, knowledgeBase }) {
   const persona = businessName
     ? `You are a real, knowledgeable staff member replying to DMs for "${businessName}".` +
@@ -699,9 +594,6 @@ function buildLeadEmail({ name, message, email, platform, assessment }) {
   return lines.join('\n');
 }
 
-// `precomputedAssessment` lets a caller that already ran assessLead() (the
-// Instagram flow does, so it can send the customer_reply immediately)
-// skip paying for a second Gemini call here.
 async function processLeadInBackground(leadId, name, message, email, platform, notificationEmail, business, precomputedAssessment) {
   const assessment = precomputedAssessment !== undefined
     ? precomputedAssessment
@@ -722,12 +614,6 @@ async function processLeadInBackground(leadId, name, message, email, platform, n
       console.log('Score saved back to Supabase for lead:', leadId, '- score', assessment.score);
     }
 
-    // While testing (no verified domain), Resend's shared sender only
-    // delivers to your own Resend-account address. Setting
-    // NOTIFY_OVERRIDE_EMAIL routes EVERY lead email there instead of the
-    // tenant's real address, so you still see all leads during testing.
-    // The intended tenant recipient is shown in the subject and body.
-    // Remove this env var once you've verified a domain.
     const override = process.env.NOTIFY_OVERRIDE_EMAIL || null;
     const intendedRecipient = notificationEmail;
     const actualRecipient = override || notificationEmail;
@@ -774,6 +660,208 @@ async function processLeadInBackground(leadId, name, message, email, platform, n
   } catch (err) {
     console.error('Post-save processing failed for lead', leadId, '-', err.message);
   }
+}
+
+// "Connect Instagram" - lets a client authorize their own account
+//
+// Flow: you send the client  /connect/instagram?key=<CONNECT_KEY>&label=<Business name>
+// -> we redirect them to Instagram's approval screen -> they log in on their
+// own device and tap Allow -> Instagram sends them to the callback below ->
+// we swap the one-time code for a long-lived token, subscribe the account to
+// webhooks, and save (or update) its row in the tenants table.
+//
+// Env vars: CONNECT_KEY (secret you put in the link), INSTAGRAM_APP_ID,
+// META_APP_SECRET (already set), optional PUBLIC_BASE_URL.
+const CONNECT_STATE_TTL_MS = 30 * 60 * 1000;
+const INSTAGRAM_SCOPES = 'instagram_business_basic,instagram_business_manage_messages';
+
+function publicBaseUrl(req) {
+  if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL.replace(/\/+$/, '');
+  const proto = req.headers['x-forwarded-proto'] || req.protocol;
+  return `${proto}://${req.get('host')}`;
+}
+
+function safeEqual(a, b) {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+// The state value proves the callback belongs to a link WE issued (blocks
+// forged callbacks) and carries the business label through the redirect.
+function signState(payload) {
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto.createHmac('sha256', process.env.META_APP_SECRET).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+
+function readState(state) {
+  if (typeof state !== 'string') return null;
+  const [body, sig] = state.split('.');
+  if (!body || !sig) return null;
+  const expected = crypto.createHmac('sha256', process.env.META_APP_SECRET).update(body).digest('base64url');
+  if (!safeEqual(sig, expected)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
+    if (!payload.t || Date.now() - payload.t > CONNECT_STATE_TTL_MS) return null;
+    return payload;
+  } catch (e) {
+    return null;
+  }
+}
+
+function connectPage(res, status, title, message) {
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  res.status(status).type('html').send(
+    `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>` +
+    '<style>body{font-family:system-ui,sans-serif;background:#0a0d0d;color:#eef0ed;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:24px}main{max-width:440px}h1{font-size:28px;margin:0 0 12px}p{color:#9aa3a0;line-height:1.5}</style>' +
+    `</head><body><main><h1>${esc(title)}</h1><p>${esc(message)}</p></main></body></html>`
+  );
+}
+
+app.get('/connect/instagram', function (req, res) {
+  if (!process.env.CONNECT_KEY || !process.env.INSTAGRAM_APP_ID || !process.env.META_APP_SECRET) {
+    return connectPage(res, 503, 'Not set up yet', 'This connection link is not enabled on the server.');
+  }
+  if (!safeEqual(req.query.key || '', process.env.CONNECT_KEY)) {
+    return connectPage(res, 403, 'Invalid link', 'This link is not valid. Please ask for a new one.');
+  }
+
+  const label = String(req.query.label || '').slice(0, 80) || null;
+  const url = new URL('https://www.instagram.com/oauth/authorize');
+  url.search = new URLSearchParams({
+    client_id: process.env.INSTAGRAM_APP_ID,
+    redirect_uri: `${publicBaseUrl(req)}/connect/instagram/callback`,
+    response_type: 'code',
+    scope: INSTAGRAM_SCOPES,
+    state: signState({ t: Date.now(), label })
+  }).toString();
+
+  res.redirect(url.toString());
+});
+
+app.get('/connect/instagram/callback', async function (req, res) {
+  if (!process.env.INSTAGRAM_APP_ID || !process.env.META_APP_SECRET) {
+    return connectPage(res, 503, 'Not set up yet', 'This connection link is not enabled on the server.');
+  }
+
+  const state = readState(req.query.state);
+  if (!state) {
+    return connectPage(res, 400, 'Link expired', 'This connection attempt expired or is invalid. Please ask for a new link.');
+  }
+  if (req.query.error || !req.query.code) {
+    return connectPage(res, 200, 'Not connected', 'Permission was not granted, so nothing was connected. Open the link again if you want to retry.');
+  }
+
+  try {
+    const redirectUri = `${publicBaseUrl(req)}/connect/instagram/callback`;
+
+    // 1. One-time code -> short-lived token
+    const shortRes = await fetchWithTimeout('https://api.instagram.com/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: process.env.INSTAGRAM_APP_ID,
+        client_secret: process.env.META_APP_SECRET,
+        grant_type: 'authorization_code',
+        redirect_uri: redirectUri,
+        code: req.query.code
+      }).toString()
+    }, 10000);
+    const shortData = await shortRes.json();
+    const shortEntry = Array.isArray(shortData.data) ? shortData.data[0] : shortData;
+    if (!shortRes.ok || !shortEntry || !shortEntry.access_token) {
+      throw new Error('Code exchange failed: ' + JSON.stringify(shortData));
+    }
+
+    // 2. Short-lived -> long-lived token (about 60 days)
+    const longRes = await fetchWithTimeout(
+      'https://graph.instagram.com/access_token?' + new URLSearchParams({
+        grant_type: 'ig_exchange_token',
+        client_secret: process.env.META_APP_SECRET,
+        access_token: shortEntry.access_token
+      }).toString(),
+      {},
+      10000
+    );
+    const longData = await longRes.json();
+    if (!longRes.ok || !longData.access_token) {
+      throw new Error('Long-lived token exchange failed: ' + JSON.stringify(longData));
+    }
+    const token = longData.access_token;
+
+    // 3. Who connected? user_id here is the same ID the webhook sends. It is
+    // read from /me as a STRING - the number in the token response is too
+    // large for JavaScript to hold exactly.
+    const meRes = await fetchWithTimeout('https://graph.instagram.com/v26.0/me?fields=user_id,username', {
+      headers: { Authorization: `Bearer ${token}` }
+    }, 8000);
+    const me = await meRes.json();
+    if (!meRes.ok || !me.user_id) throw new Error('Profile lookup failed: ' + JSON.stringify(me));
+    const igId = String(me.user_id);
+    const username = me.username || null;
+
+    // 4. Subscribe the account to message webhooks (the dashboard's
+    // "Webhook Subscription" toggle does the same thing).
+    let subscribed = false;
+    try {
+      const subRes = await fetchWithTimeout(
+        `https://graph.instagram.com/v26.0/${igId}/subscribed_apps?subscribed_fields=messages`,
+        { method: 'POST', headers: { Authorization: `Bearer ${token}` } },
+        8000
+      );
+      const subData = await subRes.json();
+      subscribed = subRes.ok && subData.success !== false;
+      if (!subscribed) console.error('Webhook subscription failed for', igId, '-', JSON.stringify(subData));
+    } catch (err) {
+      console.error('Webhook subscription threw for', igId, '-', err.message);
+    }
+
+    // 5. Save: update the token if this account already has a tenant row,
+    // otherwise create one (switched OFF until its knowledge base is filled in).
+    const existingRes = await fetchWithTimeout(
+      `${process.env.SUPABASE_URL}/rest/v1/tenants?instagram_account_id=eq.${encodeURIComponent(igId)}&select=id&limit=1`,
+      { headers: supabaseHeaders() },
+      8000
+    );
+    const existing = existingRes.ok ? await existingRes.json() : null;
+    if (!Array.isArray(existing)) throw new Error('Tenant lookup failed');
+
+    if (existing.length > 0) {
+      await patchTenantToken(existing[0].id, token);
+      console.log(`Connect: refreshed token for @${username} (${igId}), tenant ${existing[0].id}, webhooks subscribed: ${subscribed}`);
+    } else {
+      const insertRes = await fetchWithTimeout(`${process.env.SUPABASE_URL}/rest/v1/tenants`, {
+        method: 'POST',
+        headers: supabaseHeaders({ 'Prefer': 'return=representation' }),
+        body: JSON.stringify({
+          business_name: state.label || (username ? `@${username}` : igId),
+          instagram_account_id: igId,
+          instagram_access_token: token,
+          notification_email: process.env.MAIL_TO || null,
+          active: false
+        })
+      }, 8000);
+      const inserted = await insertRes.json();
+      if (!insertRes.ok) throw new Error('Tenant insert failed: ' + JSON.stringify(inserted));
+      console.log(`Connect: created tenant ${inserted[0] && inserted[0].id} for @${username} (${igId}), inactive, webhooks subscribed: ${subscribed}`);
+    }
+    tenantCache.delete(igId);
+
+    return connectPage(res, 200, 'Connected', `${username ? '@' + username : 'Your Instagram account'} is now connected. You can close this page.`);
+  } catch (err) {
+    console.error('Instagram connect failed:', err.message);
+    return connectPage(res, 500, 'Something went wrong', 'We could not finish connecting the account. Please tell us and we will fix it.');
+  }
+});
+
+async function patchTenantToken(tenantId, token) {
+  const response = await fetchWithTimeout(
+    `${process.env.SUPABASE_URL}/rest/v1/tenants?id=eq.${tenantId}`,
+    { method: 'PATCH', headers: supabaseHeaders(), body: JSON.stringify({ instagram_access_token: token }) },
+    8000
+  );
+  if (!response.ok) throw new Error('Token save failed: ' + JSON.stringify(await response.json().catch(() => ({}))));
 }
 
 app.listen(3000, function () {
