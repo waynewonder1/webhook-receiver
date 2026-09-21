@@ -239,9 +239,19 @@ function rememberMid(mid) {
   }
 }
 
+function forgetMid(mid) {
+  if (mid) seenMessageIds.delete(mid);
+}
+
 async function isDuplicateMid(mid) {
   if (!mid) return false;
   if (seenMessageIds.has(mid)) return true;
+
+  // Claim the message now, before any await. Meta often delivers the same
+  // event twice at almost the same moment (especially when a sleeping free
+  // instance wakes up); without this, both copies pass the check and the
+  // customer gets two replies and two leads.
+  rememberMid(mid);
 
   if (persistentDedupeEnabled) {
     try {
@@ -348,6 +358,7 @@ async function handleInstagramLead({ senderId, recipientId, mid, text }) {
       return;
     }
     console.error('Failed to save Instagram lead from', senderId, '-', err.message);
+    forgetMid(mid);
     return;
   }
   rememberMid(mid);
@@ -390,9 +401,9 @@ async function handleInstagramLead({ senderId, recipientId, mid, text }) {
   );
 }
 
-// ---------------------------------------------------------------------------
+
 // Routes
-// ---------------------------------------------------------------------------
+
 
 app.get('/webhook', function (req, res) {
   const mode = req.query['hub.mode'];
@@ -464,6 +475,14 @@ app.post('/webhook', async function (req, res) {
   });
 });
 
+// Models are tried in order, one per attempt, so if one is overloaded or
+// slow the next attempt goes to a different one. Override with a
+// comma-separated GEMINI_MODELS env var on Render when Google retires a
+// model (older models start returning 404 "no longer available").
+const GEMINI_MODELS = (process.env.GEMINI_MODELS || 'gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite')
+  .split(',').map((m) => m.trim()).filter(Boolean);
+const GEMINI_ATTEMPT_TIMEOUT_MS = 15000;
+
 async function assessLead({ name, message, platform, businessName, businessContext, knowledgeBase }) {
   const persona = businessName
     ? `You are a real, knowledgeable staff member replying to DMs for "${businessName}".` +
@@ -498,10 +517,12 @@ Reply with ONLY a JSON object - no markdown, no code fences - in exactly this sh
   "customer_reply": "<the message to send back to the customer, per the rules above>"
 }`;
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  const maxAttempts = GEMINI_MODELS.length;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const model = GEMINI_MODELS[attempt - 1];
     try {
       const response = await fetchWithTimeout(
-        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
         {
           method: 'POST',
           headers: {
@@ -513,22 +534,26 @@ Reply with ONLY a JSON object - no markdown, no code fences - in exactly this sh
             generationConfig: { temperature: 0.2, responseMimeType: 'application/json' }
           })
         },
-        10000
+        GEMINI_ATTEMPT_TIMEOUT_MS
       );
 
       const data = await response.json();
 
       if (!response.ok || !data.candidates || !data.candidates[0]) {
-        console.error(`Gemini API error (attempt ${attempt}):`, JSON.stringify(data));
-        if (data?.error?.code === 503 && attempt < 3) {
-          await new Promise(r => setTimeout(r, attempt * 1000));
+        console.error(`Gemini API error (attempt ${attempt}, ${model}):`, JSON.stringify(data));
+        if (attempt < maxAttempts) {
+          // Overloaded/rate-limited: give it a moment. A permanent error on
+          // this model (e.g. 404 retired) needs no wait - just try the next.
+          const code = data?.error?.code;
+          const transient = code === 503 || code === 429 || code >= 500;
+          if (transient) await new Promise(r => setTimeout(r, attempt * 1000));
           continue;
         }
         break;
       }
 
       const raw = data.candidates[0].content.parts[0].text;
-      console.log('Gemini assessment:', raw);
+      console.log(`Gemini assessment (${model}):`, raw);
 
       let parsed;
       try {
@@ -548,8 +573,8 @@ Reply with ONLY a JSON object - no markdown, no code fences - in exactly this sh
         raw
       };
     } catch (err) {
-      console.error(`Gemini call threw (attempt ${attempt}):`, err.message);
-      if (attempt < 3) {
+      console.error(`Gemini call threw (attempt ${attempt}, ${model}):`, err.message);
+      if (attempt < maxAttempts) {
         await new Promise(r => setTimeout(r, attempt * 1000));
         continue;
       }
