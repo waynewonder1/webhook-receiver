@@ -372,6 +372,65 @@ async function getConversationHistory(igId, senderId, accessToken, currentText) 
   }
 }
 
+// If Gemini is slow, the customer gets a short holding message after
+// HOLD_AFTER_MS instead of silence (the real answer follows when it is ready).
+// If every model fails, we try again later and send the answer as a follow-up.
+const HOLD_AFTER_MS = 20 * 1000;
+const LATE_ANSWER_DELAYS_MS = [60 * 1000, 3 * 60 * 1000, 10 * 60 * 1000];
+const MAX_PENDING_LATE_ANSWERS = 50;
+const DEFAULT_HOLDING_REPLY = "Thanks for reaching out! We've received your message and will get back to you shortly.";
+let pendingLateAnswers = 0;
+
+const normalizeText = (t) => String(t || '').replace(/\s+/g, ' ').trim();
+
+async function answerLater({ tenant, senderId, text, holdingText, leadId, name, business }) {
+  if (pendingLateAnswers >= MAX_PENDING_LATE_ANSWERS) return;
+  pendingLateAnswers++;
+  try {
+    for (let i = 0; i < LATE_ANSWER_DELAYS_MS.length; i++) {
+      await new Promise((r) => setTimeout(r, LATE_ANSWER_DELAYS_MS[i]));
+
+      // Only answer if nothing has happened in the chat since our holding
+      // message: no reply from the owner, and no newer message from the
+      // customer (a newer message gets its own answer that already covers this one).
+      const history = await getConversationHistory(tenant.instagram_account_id, senderId, tenant.instagram_access_token, text);
+      let earlier = history;
+      if (history.length >= 2) {
+        const last = history[history.length - 1];
+        const prev = history[history.length - 2];
+        const stillWaiting = last.who === 'Us' && normalizeText(last.text) === normalizeText(holdingText).slice(0, 500) &&
+          prev.who === 'Customer' && normalizeText(prev.text) === normalizeText(text).slice(0, 500);
+        if (!stillWaiting) {
+          console.log('Late answer skipped for lead', leadId, '- the conversation has moved on');
+          return;
+        }
+        earlier = history.slice(0, -2);
+      }
+
+      const assessment = await assessLead({
+        history: earlier,
+        name,
+        message: text,
+        platform: 'Instagram',
+        businessName: business.name,
+        businessContext: business.context,
+        knowledgeBase: tenant.knowledge_base || null
+      });
+
+      if (assessment && assessment.customer_reply) {
+        console.log(`Late answer ready for lead ${leadId} (retry ${i + 1}) - sending`);
+        sendInstagramAutoReply(tenant.instagram_account_id, senderId, assessment.customer_reply, tenant.instagram_access_token);
+        await processLeadInBackground(leadId, name, text, null, 'Instagram', tenant.notification_email, business, assessment);
+        return;
+      }
+      console.error(`Late answer retry ${i + 1} failed for lead ${leadId}`);
+    }
+    console.error('Gave up answering lead', leadId, '- it needs a manual reply');
+  } finally {
+    pendingLateAnswers--;
+  }
+}
+
 async function handleInstagramLead({ senderId, recipientId, mid, text }) {
   if (await isDuplicateMid(mid)) {
     console.log('Skipping duplicate Instagram message:', mid);
@@ -410,20 +469,37 @@ async function handleInstagramLead({ senderId, recipientId, mid, text }) {
 
   const history = await getConversationHistory(tenant.instagram_account_id, senderId, tenant.instagram_access_token, text);
 
-  const assessment = await assessLead({
-    history,
-    name: placeholderName,
-    message: text,
-    platform: 'Instagram',
-    businessName: tenant.business_name || tenant.name || null,
-    businessContext: tenant.business_description || null,
-    knowledgeBase: tenant.knowledge_base || null
-  });
+  const business = { name: tenant.business_name || tenant.name || null, context: tenant.business_description || null };
+  const holdingText = tenant.auto_reply_message || DEFAULT_HOLDING_REPLY;
 
-  const replyText = (assessment && assessment.customer_reply) ||
-    tenant.auto_reply_message ||
-    "Thanks for reaching out! We've received your message and will get back to you shortly.";
-  sendInstagramAutoReply(tenant.instagram_account_id, senderId, replyText, tenant.instagram_access_token);
+  let holdingSent = false;
+  const holdTimer = setTimeout(() => {
+    holdingSent = true;
+    sendInstagramAutoReply(tenant.instagram_account_id, senderId, holdingText, tenant.instagram_access_token);
+  }, HOLD_AFTER_MS);
+
+  let assessment;
+  try {
+    assessment = await assessLead({
+      history,
+      name: placeholderName,
+      message: text,
+      platform: 'Instagram',
+      businessName: business.name,
+      businessContext: business.context,
+      knowledgeBase: tenant.knowledge_base || null
+    });
+  } finally {
+    clearTimeout(holdTimer);
+  }
+
+  const answered = !!(assessment && assessment.customer_reply);
+  if (answered) {
+    sendInstagramAutoReply(tenant.instagram_account_id, senderId, assessment.customer_reply, tenant.instagram_access_token);
+  } else if (!holdingSent) {
+    holdingSent = true;
+    sendInstagramAutoReply(tenant.instagram_account_id, senderId, holdingText, tenant.instagram_access_token);
+  }
 
   let name = placeholderName;
   const realName = await getInstagramSenderName(senderId, tenant.instagram_access_token, tenant.id);
@@ -442,11 +518,13 @@ async function handleInstagramLead({ senderId, recipientId, mid, text }) {
     console.warn('No name for lead', leadId, '- left as placeholder, will retry on their next message');
   }
 
-  await processLeadInBackground(
-    leadId, name, text, null, 'Instagram', tenant.notification_email,
-    { name: tenant.business_name || tenant.name || null, context: tenant.business_description || null },
-    assessment
-  );
+  await processLeadInBackground(leadId, name, text, null, 'Instagram', tenant.notification_email, business, assessment);
+
+  if (!answered) {
+    answerLater({ tenant, senderId, text, holdingText, leadId, name, business }).catch(function (err) {
+      console.error('answerLater crashed for lead', leadId, '-', err.message);
+    });
+  }
 }
 
 
