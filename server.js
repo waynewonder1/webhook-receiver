@@ -9,7 +9,7 @@ const MAIL_FROM = process.env.MAIL_FROM || 'onboarding@resend.dev';
 // Answered before the request logger so a monitor pinging this every few
 // minutes (to stop the free Render instance from sleeping) doesn't fill the logs.
 app.get('/health', function (req, res) {
-  res.status(200).json({ ok: true, uptime: Math.round(process.uptime()) });
+  res.status(200).json({ ok: true, uptime: Math.round(process.uptime()), commit: (process.env.RENDER_GIT_COMMIT || 'local').slice(0, 7) });
 });
 
 app.use(function (req, res, next) {
@@ -607,7 +607,80 @@ app.post('/webhook', async function (req, res) {
 // model (older models start returning 404 "no longer available").
 const GEMINI_MODELS = (process.env.GEMINI_MODELS || 'gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite')
   .split(',').map((m) => m.trim()).filter(Boolean);
-const GEMINI_ATTEMPT_TIMEOUT_MS = 15000;
+const GEMINI_ATTEMPT_TIMEOUT_MS = 30000;
+// If a model has not answered after HEDGE_DELAY, the next model is started
+// alongside it and whichever answers first wins. A model that fails outright
+// is replaced immediately. Everything is abandoned after OVERALL_TIMEOUT.
+const GEMINI_HEDGE_DELAY_MS = 8000;
+const GEMINI_OVERALL_TIMEOUT_MS = 45000;
+
+async function callGeminiModel(model, prompt, signal) {
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    {
+      method: 'POST',
+      headers: { 'x-goog-api-key': process.env.GEMINI_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.2, responseMimeType: 'application/json' }
+      }),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(GEMINI_ATTEMPT_TIMEOUT_MS)])
+    }
+  );
+  const data = await response.json();
+  if (!response.ok || !data.candidates || !data.candidates[0]) {
+    throw new Error(JSON.stringify(data).slice(0, 200));
+  }
+  const raw = data.candidates[0].content.parts[0].text;
+  return { model, raw, parsed: JSON.parse(raw) };
+}
+
+// Asks the models in order, starting the next one early when the current one
+// is slow or fails. Resolves with the first valid answer, or null.
+function askGemini(prompt) {
+  return new Promise((resolve) => {
+    const controllers = [];
+    let started = 0;
+    let failed = 0;
+    let settled = false;
+    let hedgeTimer = null;
+
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hedgeTimer);
+      clearTimeout(overallTimer);
+      controllers.forEach((c) => c.abort());
+      resolve(value);
+    };
+    const overallTimer = setTimeout(() => {
+      console.error('Gemini gave up after', GEMINI_OVERALL_TIMEOUT_MS, 'ms');
+      finish(null);
+    }, GEMINI_OVERALL_TIMEOUT_MS);
+
+    const startNext = () => {
+      clearTimeout(hedgeTimer);
+      if (settled || started >= GEMINI_MODELS.length) return;
+      const model = GEMINI_MODELS[started++];
+      const controller = new AbortController();
+      controllers.push(controller);
+
+      callGeminiModel(model, prompt, controller.signal)
+        .then(finish)
+        .catch((err) => {
+          if (settled) return;
+          console.error(`Gemini attempt failed (${model}):`, err.message);
+          failed++;
+          if (failed >= GEMINI_MODELS.length) finish(null);
+          else startNext();
+        });
+
+      if (started < GEMINI_MODELS.length) hedgeTimer = setTimeout(startNext, GEMINI_HEDGE_DELAY_MS);
+    };
+
+    startNext();
+  });
+}
 
 async function assessLead({ name, message, platform, businessName, businessContext, knowledgeBase, history }) {
   const persona = businessName
@@ -650,72 +723,20 @@ Reply with ONLY a JSON object - no markdown, no code fences - in exactly this sh
   "customer_reply": "<the message to send back to the customer, per the rules above>"
 }`;
 
-  const maxAttempts = GEMINI_MODELS.length;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const model = GEMINI_MODELS[attempt - 1];
-    try {
-      const response = await fetchWithTimeout(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-        {
-          method: 'POST',
-          headers: {
-            'x-goog-api-key': process.env.GEMINI_KEY,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: { temperature: 0.2, responseMimeType: 'application/json' }
-          })
-        },
-        GEMINI_ATTEMPT_TIMEOUT_MS
-      );
+  const result = await askGemini(prompt);
+  if (!result) return null; // total failure - lead still gets emailed, just without a score
 
-      const data = await response.json();
-
-      if (!response.ok || !data.candidates || !data.candidates[0]) {
-        console.error(`Gemini API error (attempt ${attempt}, ${model}):`, JSON.stringify(data));
-        if (attempt < maxAttempts) {
-          // Overloaded/rate-limited: give it a moment. A permanent error on
-          // this model (e.g. 404 retired) needs no wait - just try the next.
-          const code = data?.error?.code;
-          const transient = code === 503 || code === 429 || code >= 500;
-          if (transient) await new Promise(r => setTimeout(r, attempt * 1000));
-          continue;
-        }
-        break;
-      }
-
-      const raw = data.candidates[0].content.parts[0].text;
-      console.log(`Gemini assessment (${model}):`, raw);
-
-      let parsed;
-      try {
-        parsed = JSON.parse(raw);
-      } catch (e) {
-        console.error('Gemini returned non-JSON - using raw text:', e.message);
-        return { score: null, category: null, reasoning: null, recommended_action: null, customer_reply: null, raw };
-      }
-
-      const n = Number(parsed.score);
-      return {
-        score: Number.isFinite(n) ? Math.max(1, Math.min(10, Math.round(n))) : null,
-        category: parsed.category || null,
-        reasoning: parsed.reasoning || null,
-        recommended_action: parsed.recommended_action || null,
-        customer_reply: parsed.customer_reply || null,
-        raw
-      };
-    } catch (err) {
-      console.error(`Gemini call threw (attempt ${attempt}, ${model}):`, err.message);
-      if (attempt < maxAttempts) {
-        await new Promise(r => setTimeout(r, attempt * 1000));
-        continue;
-      }
-      break;
-    }
-  }
-
-  return null; // total failure - lead still gets emailed, just without a score
+  console.log(`Gemini assessment (${result.model}):`, result.raw);
+  const parsed = result.parsed;
+  const n = Number(parsed.score);
+  return {
+    score: Number.isFinite(n) ? Math.max(1, Math.min(10, Math.round(n))) : null,
+    category: parsed.category || null,
+    reasoning: parsed.reasoning || null,
+    recommended_action: parsed.recommended_action || null,
+    customer_reply: parsed.customer_reply || null,
+    raw: result.raw
+  };
 }
 
 const CATEGORY_EMOJI = { hot: '🔥', warm: '🌤️', cold: '❄️', spam: '🚫' };
