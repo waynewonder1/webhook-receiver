@@ -9,6 +9,19 @@ const EDITABLE_FIELDS = [
   { key: 'knowledge_base', label: 'Knowledge base (prices, services, policies...)', type: 'textarea' }
 ];
 
+// Shows how many days a client's Instagram token has left, so a token that
+// is about to expire is visible at a glance (the server renews them itself,
+// but this is where you'd notice if that ever stops working).
+function TokenPill({ expiresAt }) {
+  if (!expiresAt) return null;
+  const days = Math.ceil((new Date(expiresAt).getTime() - Date.now()) / 86400000);
+  return (
+    <span className={`pill ${days > 14 ? 'on' : 'off'}`}>
+      {days > 0 ? `Token: ${days}d left` : 'Token expired'}
+    </span>
+  );
+}
+
 // One editable tenant card. Keeps its own draft state so typing doesn't
 // touch the parent list until you actually hit Save.
 function TenantCard({ tenant, onSaved }) {
@@ -44,6 +57,7 @@ function TenantCard({ tenant, onSaved }) {
         <span className={`pill ${tenant.active ? 'on' : 'off'}`}>
           {tenant.active ? 'Active' : 'Inactive'}
         </span>
+        <TokenPill expiresAt={tenant.token_expires_at} />
         <span>IG account: {tenant.instagram_account_id || 'not set'}</span>
       </div>
 

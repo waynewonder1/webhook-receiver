@@ -6,6 +6,12 @@ const app = express();
 
 const MAIL_FROM = process.env.MAIL_FROM || 'onboarding@resend.dev';
 
+// Answered before the request logger so a monitor pinging this every few
+// minutes (to stop the free Render instance from sleeping) doesn't fill the logs.
+app.get('/health', function (req, res) {
+  res.status(200).json({ ok: true, uptime: Math.round(process.uptime()) });
+});
+
 app.use(function (req, res, next) {
   console.log('Incoming request:', req.method, req.path);
   next();
@@ -327,6 +333,45 @@ function extractInstagramMessages(body) {
 
   return messages;
 }
+// Recent chat with this customer, read from Instagram itself. It includes
+// our earlier auto-replies AND anything the business owner typed by hand, so
+// the assistant can follow the conversation instead of answering every
+// message as if it were the first. Returns oldest-first, or [] on any
+// problem (the assistant then just behaves as it did before).
+const HISTORY_MESSAGES = 10;
+const HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+async function getConversationHistory(igId, senderId, accessToken, currentText) {
+  if (!accessToken) return [];
+  try {
+    const url = `https://graph.instagram.com/v26.0/${igId}/conversations?platform=instagram&user_id=${encodeURIComponent(senderId)}` +
+      `&fields=messages.limit(${HISTORY_MESSAGES + 3}){created_time,from,message}`;
+    const response = await fetchWithTimeout(url, { headers: { Authorization: `Bearer ${accessToken}` } }, 6000);
+    const data = await response.json();
+    if (!response.ok) {
+      console.error('Conversation history lookup failed:', JSON.stringify(data));
+      return [];
+    }
+
+    const raw = (data.data && data.data[0] && data.data[0].messages && data.data[0].messages.data) || [];
+    let msgs = raw.filter((m) => m.message && Date.now() - Date.parse(m.created_time) < HISTORY_MAX_AGE_MS);
+
+    // Newest first. The message we're answering right now may already be in
+    // the list - drop it so it isn't shown twice.
+    if (msgs[0] && msgs[0].from && msgs[0].from.id === senderId && msgs[0].message === currentText) {
+      msgs = msgs.slice(1);
+    }
+
+    return msgs
+      .slice(0, HISTORY_MESSAGES)
+      .reverse()
+      .map((m) => ({ who: m.from && m.from.id === senderId ? 'Customer' : 'Us', text: String(m.message).slice(0, 500) }));
+  } catch (err) {
+    console.error('Conversation history lookup threw:', err.message);
+    return [];
+  }
+}
+
 async function handleInstagramLead({ senderId, recipientId, mid, text }) {
   if (await isDuplicateMid(mid)) {
     console.log('Skipping duplicate Instagram message:', mid);
@@ -363,7 +408,10 @@ async function handleInstagramLead({ senderId, recipientId, mid, text }) {
   }
   rememberMid(mid);
 
+  const history = await getConversationHistory(tenant.instagram_account_id, senderId, tenant.instagram_access_token, text);
+
   const assessment = await assessLead({
+    history,
     name: placeholderName,
     message: text,
     platform: 'Instagram',
@@ -483,7 +531,7 @@ const GEMINI_MODELS = (process.env.GEMINI_MODELS || 'gemini-3.6-flash,gemini-3.5
   .split(',').map((m) => m.trim()).filter(Boolean);
 const GEMINI_ATTEMPT_TIMEOUT_MS = 15000;
 
-async function assessLead({ name, message, platform, businessName, businessContext, knowledgeBase }) {
+async function assessLead({ name, message, platform, businessName, businessContext, knowledgeBase, history }) {
   const persona = businessName
     ? `You are a real, knowledgeable staff member replying to DMs for "${businessName}".` +
       (businessContext ? ` About the business: ${businessContext}` : '')
@@ -498,12 +546,19 @@ Here is everything you're allowed to know about the business's products, service
 ${kb || '(no product/pricing info has been provided yet)'}
 """
 
-A person named "${name}" sent this message via ${platform}:
+${history && history.length ? `Earlier in this same chat (oldest first - "Us" is the business, "Customer" is ${name}):
+"""
+${history.map((h) => `${h.who}: ${h.text}`).join('\n')}
+"""
+
+` : ''}${history && history.length ? 'The customer\'s LATEST message, which you are answering now' : `A person named "${name}" sent this message via ${platform}`}:
 """
 ${message}
 """
 
-Do two things:
+${history && history.length ? `This is a continuing conversation. Use the earlier messages for context (what they already asked, what we already told them). Do not repeat information we already gave, do not greet or re-introduce the business again, and answer the latest message directly. Judge buying intent from the whole conversation, not just the last line.
+
+` : ''}Do two things:
 
 1. Assess this as a sales lead for the internal team (they will NOT see your reply to the customer, only this assessment).
 2. Draft the actual reply to send back to the customer right now, as a real conversation - not a form letter. Address what they specifically asked. If the knowledge base above answers their question (a price, a product detail, availability, a policy), state it directly and confidently. If it does NOT contain the answer, say so honestly and let them know a team member will follow up with the specifics - do NOT guess or make up numbers. Keep it warm, 2-5 sentences.
@@ -853,7 +908,7 @@ app.get('/connect/instagram/callback', async function (req, res) {
     if (!Array.isArray(existing)) throw new Error('Tenant lookup failed');
 
     if (existing.length > 0) {
-      await patchTenantToken(existing[0].id, token);
+      await patchTenantToken(existing[0].id, token, longData.expires_in);
       console.log(`Connect: refreshed token for @${username} (${igId}), tenant ${existing[0].id}, webhooks subscribed: ${subscribed}`);
     } else {
       const insertRes = await fetchWithTimeout(`${process.env.SUPABASE_URL}/rest/v1/tenants`, {
@@ -864,7 +919,8 @@ app.get('/connect/instagram/callback', async function (req, res) {
           instagram_account_id: igId,
           instagram_access_token: token,
           notification_email: process.env.MAIL_TO || null,
-          active: false
+          active: false,
+          ...tokenExpiryFields(longData.expires_in)
         })
       }, 8000);
       const inserted = await insertRes.json();
@@ -880,10 +936,131 @@ app.get('/connect/instagram/callback', async function (req, res) {
   }
 });
 
-async function patchTenantToken(tenantId, token) {
+// ---------------------------------------------------------------------------
+// Keeping Instagram tokens alive
+// ---------------------------------------------------------------------------
+// A long-lived Instagram token lasts about 60 days. Renewing one (allowed once
+// it is 24h old and before it expires) gives it another 60 days. Once a day
+// we renew any active client's token that has under 21 days left, and email
+// you if one is close to dying and could not be renewed. When the optional
+// tenants.token_expires_at column exists we remember each expiry date;
+// without it every token is simply renewed on each check.
+const TOKEN_RENEW_WHEN_LEFT_MS = 21 * 24 * 60 * 60 * 1000;
+const TOKEN_ALERT_WHEN_LEFT_MS = 7 * 24 * 60 * 60 * 1000;
+const TOKEN_CHECK_EVERY_MS = 24 * 60 * 60 * 1000;
+let tokenExpiryColumnEnabled = false;
+const tokenAlertedAt = new Map();
+
+function tokenExpiryFields(expiresInSeconds) {
+  if (!tokenExpiryColumnEnabled || !Number.isFinite(Number(expiresInSeconds))) return {};
+  return { token_expires_at: new Date(Date.now() + Number(expiresInSeconds) * 1000).toISOString() };
+}
+
+async function detectTokenExpiryColumn() {
+  try {
+    const response = await fetchWithTimeout(
+      `${process.env.SUPABASE_URL}/rest/v1/tenants?select=token_expires_at&limit=1`,
+      { headers: supabaseHeaders() },
+      8000
+    );
+    tokenExpiryColumnEnabled = response.ok;
+    if (response.ok) {
+      console.log('Token expiry tracking ENABLED (tenants.token_expires_at present)');
+    } else {
+      console.warn('tenants.token_expires_at not found - to track expiry dates run: alter table tenants add column if not exists token_expires_at timestamptz;');
+    }
+  } catch (err) {
+    console.warn('Could not probe tenants.token_expires_at:', err.message);
+  }
+}
+
+async function renewInstagramToken(token) {
+  const response = await fetchWithTimeout(
+    'https://graph.instagram.com/refresh_access_token?' +
+      new URLSearchParams({ grant_type: 'ig_refresh_token', access_token: token }).toString(),
+    {},
+    10000
+  );
+  const data = await response.json();
+  if (!response.ok || !data.access_token) {
+    const err = new Error((data && data.error && data.error.message) || 'Token renewal failed');
+    err.code = data && data.error && data.error.code;
+    throw err;
+  }
+  return { token: data.access_token, expiresIn: data.expires_in };
+}
+
+async function sendAdminAlert(subject, text) {
+  const to = process.env.NOTIFY_OVERRIDE_EMAIL || process.env.MAIL_TO;
+  if (!to || !process.env.RESEND_API_KEY) {
+    console.error('ALERT (no email configured):', subject);
+    return;
+  }
+  try {
+    await fetchWithTimeout('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: MAIL_FROM, to, subject, text })
+    }, 10000);
+  } catch (err) {
+    console.error('Could not send alert email:', err.message);
+  }
+}
+
+async function renewTenantTokens() {
+  const cols = 'id,business_name,instagram_account_id,instagram_access_token' + (tokenExpiryColumnEnabled ? ',token_expires_at' : '');
+  const response = await fetchWithTimeout(
+    `${process.env.SUPABASE_URL}/rest/v1/tenants?active=eq.true&select=${cols}`,
+    { headers: supabaseHeaders() },
+    8000
+  );
+  if (!response.ok) {
+    console.error('Token check: could not load tenants:', response.status);
+    return;
+  }
+
+  for (const t of await response.json()) {
+    const token = t.instagram_access_token;
+    if (!token || token.startsWith('PASTE')) continue;
+
+    const expiresAt = t.token_expires_at ? Date.parse(t.token_expires_at) : null;
+    const left = expiresAt ? expiresAt - Date.now() : null;
+    if (left !== null && left > TOKEN_RENEW_WHEN_LEFT_MS) continue;
+
+    try {
+      const fresh = await renewInstagramToken(token);
+      await patchTenantToken(t.id, fresh.token, fresh.expiresIn);
+      tenantCache.delete(t.instagram_account_id);
+      console.log(`Token renewed for ${t.business_name} (tenant ${t.id})`);
+    } catch (err) {
+      console.error(`Token renewal failed for ${t.business_name} (tenant ${t.id}):`, err.message);
+      // Code 190 = Instagram says the token is invalid or expired.
+      const dying = left !== null && left < TOKEN_ALERT_WHEN_LEFT_MS;
+      const dead = err.code === 190;
+      const lastAlert = tokenAlertedAt.get(t.id) || 0;
+      if ((dying || dead) && Date.now() - lastAlert > TOKEN_CHECK_EVERY_MS) {
+        tokenAlertedAt.set(t.id, Date.now());
+        await sendAdminAlert(
+          `Action needed: Instagram connection for ${t.business_name}`,
+          `The Instagram connection for "${t.business_name}" (tenant ${t.id}) ${dead ? 'has expired or been revoked' : 'is about to expire'} and could not be renewed automatically.\n\n` +
+          `Reason: ${err.message}\n\nUntil it is reconnected, the assistant cannot reply for this business. ` +
+          'Send them the connect link again and ask them to open it and tap Allow.'
+        );
+      }
+    }
+  }
+}
+
+function startTokenRenewal() {
+  const run = () => renewTenantTokens().catch((err) => console.error('Token check crashed:', err.message));
+  setTimeout(run, 45 * 1000).unref();
+  setInterval(run, TOKEN_CHECK_EVERY_MS).unref();
+}
+
+async function patchTenantToken(tenantId, token, expiresInSeconds) {
   const response = await fetchWithTimeout(
     `${process.env.SUPABASE_URL}/rest/v1/tenants?id=eq.${tenantId}`,
-    { method: 'PATCH', headers: supabaseHeaders(), body: JSON.stringify({ instagram_access_token: token }) },
+    { method: 'PATCH', headers: supabaseHeaders(), body: JSON.stringify({ instagram_access_token: token, ...tokenExpiryFields(expiresInSeconds) }) },
     8000
   );
   if (!response.ok) throw new Error('Token save failed: ' + JSON.stringify(await response.json().catch(() => ({}))));
@@ -892,4 +1069,6 @@ async function patchTenantToken(tenantId, token) {
 app.listen(3000, function () {
   console.log('WebHook receiver running on http://localhost:3000');
   detectPersistentDedupe();
+  detectTokenExpiryColumn();
+  startTokenRenewal();
 });
