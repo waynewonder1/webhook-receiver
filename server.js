@@ -156,6 +156,22 @@ const NAME_CACHE_TTL_MS = 60 * 60 * 1000;
 const NAME_CACHE_NEG_TTL_MS = 5 * 60 * 1000;
 const NAME_CACHE_LIMIT = 5000;
 
+// IDs of messages our own server sent, so we can tell a bot reply from one
+// the business owner typed by hand in the Instagram app. In-memory only -
+// same tradeoff as the message dedupe set above (resets on restart), which
+// just means a human takeover right around a restart might go undetected
+// for one message.
+const sentMessageIds = new Set();
+const SENT_MESSAGE_LIMIT = 2000;
+
+function rememberSent(id) {
+  if (!id) return;
+  sentMessageIds.add(id);
+  if (sentMessageIds.size > SENT_MESSAGE_LIMIT) {
+    sentMessageIds.delete(sentMessageIds.values().next().value);
+  }
+}
+
 async function sendInstagramAutoReply(igId, senderId, text, accessToken) {
   if (!accessToken) {
     console.error('No access token available - cannot send auto-reply to', senderId);
@@ -184,6 +200,7 @@ async function sendInstagramAutoReply(igId, senderId, text, accessToken) {
       console.error('Auto-reply failed for', senderId, '-', JSON.stringify(data));
     } else {
       console.log('Auto-reply sent to', senderId, '- message id:', data.message_id);
+      rememberSent(data.message_id);
     }
   } catch (err) {
     console.error('Auto-reply threw for', senderId, '-', err.message);
@@ -345,7 +362,7 @@ async function getConversationHistory(igId, senderId, accessToken, currentText) 
   if (!accessToken) return [];
   try {
     const url = `https://graph.instagram.com/v26.0/${igId}/conversations?platform=instagram&user_id=${encodeURIComponent(senderId)}` +
-      `&fields=messages.limit(${HISTORY_MESSAGES + 3}){created_time,from,message}`;
+      `&fields=messages.limit(${HISTORY_MESSAGES + 3}){id,created_time,from,message}`;
     const response = await fetchWithTimeout(url, { headers: { Authorization: `Bearer ${accessToken}` } }, 6000);
     const data = await response.json();
     if (!response.ok) {
@@ -365,7 +382,13 @@ async function getConversationHistory(igId, senderId, accessToken, currentText) 
     return msgs
       .slice(0, HISTORY_MESSAGES)
       .reverse()
-      .map((m) => ({ who: m.from && m.from.id === senderId ? 'Customer' : 'Us', text: String(m.message).slice(0, 500) }));
+      .map((m) => ({
+        who: m.from && m.from.id === senderId ? 'Customer' : 'Us',
+        text: String(m.message).slice(0, 500),
+        id: m.id || null,
+        time: Date.parse(m.created_time) || null,
+        botSent: sentMessageIds.has(m.id)
+      }));
   } catch (err) {
     console.error('Conversation history lookup threw:', err.message);
     return [];
@@ -379,6 +402,17 @@ const HOLD_AFTER_MS = 20 * 1000;
 const LATE_ANSWER_DELAYS_MS = [60 * 1000, 3 * 60 * 1000, 10 * 60 * 1000];
 const MAX_PENDING_LATE_ANSWERS = 50;
 const DEFAULT_HOLDING_REPLY = "Thanks for reaching out! We've received your message and will get back to you shortly.";
+// If the owner's last message in this chat was typed by hand (not sent by
+// us) within this window, we stay quiet instead of auto-replying on top of
+// them - the lead is still saved and emailed, just not answered on Instagram.
+const HUMAN_TAKEOVER_WINDOW_MS = 12 * 60 * 60 * 1000;
+
+function humanIsHandling(history) {
+  const last = history[history.length - 1];
+  if (!last || last.who !== 'Us' || last.botSent) return false;
+  return last.time != null && Date.now() - last.time < HUMAN_TAKEOVER_WINDOW_MS;
+}
+
 let pendingLateAnswers = 0;
 
 const normalizeText = (t) => String(t || '').replace(/\s+/g, ' ').trim();
@@ -472,8 +506,16 @@ async function handleInstagramLead({ senderId, recipientId, mid, text }) {
   const business = { name: tenant.business_name || tenant.name || null, context: tenant.business_description || null };
   const holdingText = tenant.auto_reply_message || DEFAULT_HOLDING_REPLY;
 
-  let holdingSent = false;
-  const holdTimer = setTimeout(() => {
+  // If the owner is already personally replying in this chat, don't talk
+  // over them - still score the lead and email it, just skip the Instagram
+  // send (and the holding message / retries, which would only add noise).
+  const paused = humanIsHandling(history);
+  if (paused) {
+    console.log('Skipping auto-reply for lead - owner is already handling this conversation:', senderId);
+  }
+
+  let holdingSent = paused;
+  const holdTimer = paused ? null : setTimeout(() => {
     holdingSent = true;
     sendInstagramAutoReply(tenant.instagram_account_id, senderId, holdingText, tenant.instagram_access_token);
   }, HOLD_AFTER_MS);
@@ -490,11 +532,13 @@ async function handleInstagramLead({ senderId, recipientId, mid, text }) {
       knowledgeBase: tenant.knowledge_base || null
     });
   } finally {
-    clearTimeout(holdTimer);
+    if (holdTimer) clearTimeout(holdTimer);
   }
 
   const answered = !!(assessment && assessment.customer_reply);
-  if (answered) {
+  if (paused) {
+    // Intentionally not sent - see above.
+  } else if (answered) {
     sendInstagramAutoReply(tenant.instagram_account_id, senderId, assessment.customer_reply, tenant.instagram_access_token);
   } else if (!holdingSent) {
     holdingSent = true;
@@ -518,9 +562,9 @@ async function handleInstagramLead({ senderId, recipientId, mid, text }) {
     console.warn('No name for lead', leadId, '- left as placeholder, will retry on their next message');
   }
 
-  await processLeadInBackground(leadId, name, text, null, 'Instagram', tenant.notification_email, business, assessment);
+  await processLeadInBackground(leadId, name, text, null, 'Instagram', tenant.notification_email, business, assessment, paused);
 
-  if (!answered) {
+  if (!paused && !answered) {
     answerLater({ tenant, senderId, text, holdingText, leadId, name, business }).catch(function (err) {
       console.error('answerLater crashed for lead', leadId, '-', err.message);
     });
@@ -741,8 +785,13 @@ Reply with ONLY a JSON object - no markdown, no code fences - in exactly this sh
 
 const CATEGORY_EMOJI = { hot: '🔥', warm: '🌤️', cold: '❄️', spam: '🚫' };
 
-function buildLeadEmail({ name, message, email, platform, assessment }) {
+function buildLeadEmail({ name, message, email, platform, assessment, paused }) {
   const lines = [];
+
+  if (paused) {
+    lines.push("YOU'RE HANDLING THIS CHAT - the assistant stayed quiet and did not reply on Instagram.");
+    lines.push('');
+  }
 
   if (assessment && assessment.score != null) {
     const cat = assessment.category ? assessment.category.toUpperCase() : 'UNCATEGORIZED';
@@ -752,7 +801,7 @@ function buildLeadEmail({ name, message, email, platform, assessment }) {
     if (assessment.recommended_action) lines.push(`Next: ${assessment.recommended_action}`);
     if (assessment.customer_reply) {
       lines.push('');
-      lines.push('What we auto-replied to them on Instagram:');
+      lines.push(paused ? 'AI-drafted reply (NOT sent - you already have this chat):' : 'What we auto-replied to them on Instagram:');
       lines.push(`  ${assessment.customer_reply}`);
     }
   } else if (assessment && assessment.raw) {
@@ -773,7 +822,7 @@ function buildLeadEmail({ name, message, email, platform, assessment }) {
   return lines.join('\n');
 }
 
-async function processLeadInBackground(leadId, name, message, email, platform, notificationEmail, business, precomputedAssessment) {
+async function processLeadInBackground(leadId, name, message, email, platform, notificationEmail, business, precomputedAssessment, paused) {
   const assessment = precomputedAssessment !== undefined
     ? precomputedAssessment
     : await assessLead({
@@ -805,9 +854,10 @@ async function processLeadInBackground(leadId, name, message, email, platform, n
     const businessLabel = business && business.name ? `[${business.name}] ` : '';
     const emoji = assessment && assessment.category ? (CATEGORY_EMOJI[assessment.category] || '') : '';
     const scoreTag = assessment && assessment.score != null ? ` (${assessment.score}/10)` : '';
-    const subject = `${businessLabel}${emoji ? emoji + ' ' : ''}New ${platform} lead: ${name}${scoreTag}`.trim();
+    const pausedTag = paused ? ' [you have this chat]' : '';
+    const subject = `${businessLabel}${emoji ? emoji + ' ' : ''}New ${platform} lead: ${name}${scoreTag}${pausedTag}`.trim();
 
-    let text = buildLeadEmail({ name, message, email, platform, assessment });
+    let text = buildLeadEmail({ name, message, email, platform, assessment, paused });
     if (override && intendedRecipient && override !== intendedRecipient) {
       text = `(Testing mode - this would normally go to ${intendedRecipient})\n\n${text}`;
     }
