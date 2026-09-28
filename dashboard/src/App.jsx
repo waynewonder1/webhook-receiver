@@ -3,6 +3,7 @@ import { supabase } from './supabaseClient';
 import Login from './Login';
 import TenantsPage from './TenantsPage';
 import LeadsPage from './LeadsPage';
+import TestPage from './TestPage';
 
 export default function App() {
   const [session, setSession] = useState(undefined); // undefined = still checking
@@ -41,6 +42,12 @@ export default function App() {
           >
             Leads
           </button>
+          <button
+            className={`nav-link ${tab === 'test' ? 'active' : ''}`}
+            onClick={() => setTab('test')}
+          >
+            Test
+          </button>
         </nav>
 
         <div className="user-box">
@@ -51,7 +58,9 @@ export default function App() {
         </div>
       </header>
 
-      {tab === 'tenants' ? <TenantsPage /> : <LeadsPage />}
+      {tab === 'tenants' && <TenantsPage />}
+      {tab === 'leads' && <LeadsPage />}
+      {tab === 'test' && <TestPage />}
     </div>
   );
 }

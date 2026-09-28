@@ -64,10 +64,36 @@ function supabaseHeaders(extra) {
     ...extra
   };
 }
-async function saveLead({ name, message, email, platform, igMid, tenantId }) {
+// Whether leads_v2.sender_id exists - the stable Instagram-scoped id of the
+// customer, needed to group a customer's messages into one conversation in
+// the dashboard (a display name alone isn't a reliable identity: it can be
+// missing, or two different people can share one). Optional - without it,
+// everything just works as before, one row per message, ungrouped.
+let senderIdColumnEnabled = false;
+
+async function detectSenderIdColumn() {
+  try {
+    const response = await fetchWithTimeout(
+      `${process.env.SUPABASE_URL}/rest/v1/leads_v2?select=sender_id&limit=1`,
+      { headers: supabaseHeaders() },
+      8000
+    );
+    senderIdColumnEnabled = response.ok;
+    if (response.ok) {
+      console.log('Conversation grouping ENABLED (leads_v2.sender_id present)');
+    } else {
+      console.warn('leads_v2.sender_id not found - leads will not be grouped by conversation. To enable it run:\n  alter table leads_v2 add column if not exists sender_id text;');
+    }
+  } catch (err) {
+    console.warn('Could not probe leads_v2.sender_id:', err.message);
+  }
+}
+
+async function saveLead({ name, message, email, platform, igMid, tenantId, senderId }) {
   const row = { name, message, email, platform };
   if (persistentDedupeEnabled && igMid) row.ig_mid = igMid;
   if (tenantId != null) row.tenant_id = tenantId;
+  if (senderIdColumnEnabled && senderId) row.sender_id = senderId;
 
   let response;
   try {
@@ -487,7 +513,8 @@ async function handleInstagramLead({ senderId, recipientId, mid, text }) {
       email: null,
       platform: 'Instagram',
       igMid: mid,
-      tenantId: tenant.id
+      tenantId: tenant.id,
+      senderId
     });
   } catch (err) {
     if (err.duplicate) {
@@ -643,6 +670,78 @@ app.post('/webhook', async function (req, res) {
   processLeadInBackground(leadId, name, message, email, platform, process.env.MAIL_TO).catch(function (err) {
     console.error('processLeadInBackground crashed for lead', leadId, '-', err.message);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Dashboard test endpoint - lets you try a knowledge-base change by typing a
+// question in the dashboard, instead of DMing yourself on Instagram. Does
+// NOT save a lead or send anything anywhere - it just runs the same AI call
+// a real message would and returns the draft reply.
+//
+// Auth: the dashboard sends the logged-in user's own Supabase session token
+// (the same one their login already produced). We ask Supabase's own auth
+// server "is this a real, currently valid session?" rather than using a
+// separate secret - so anyone who can log into the dashboard can use this,
+// and nobody else can, with no extra password to manage or leak.
+async function verifyDashboardUser(req) {
+  const auth = req.headers['authorization'] || '';
+  if (!auth.startsWith('Bearer ')) return null;
+  try {
+    const response = await fetchWithTimeout(`${process.env.SUPABASE_URL}/auth/v1/user`, {
+      headers: { apikey: process.env.SUPABASE_KEY, Authorization: auth }
+    }, 8000);
+    if (!response.ok) return null;
+    return await response.json();
+  } catch (err) {
+    return null;
+  }
+}
+
+function setTestReplyCors(res) {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+}
+
+app.options('/api/test-reply', function (req, res) {
+  setTestReplyCors(res);
+  res.sendStatus(204);
+});
+
+app.post('/api/test-reply', async function (req, res) {
+  setTestReplyCors(res);
+
+  const user = await verifyDashboardUser(req);
+  if (!user) return res.status(401).json({ error: 'Not signed in' });
+
+  const { tenantId, message, history } = req.body || {};
+  if (!tenantId || !message) return res.status(400).json({ error: 'tenantId and message are required' });
+
+  try {
+    const tRes = await fetchWithTimeout(
+      `${process.env.SUPABASE_URL}/rest/v1/tenants?id=eq.${encodeURIComponent(tenantId)}&select=business_name,business_description,knowledge_base`,
+      { headers: supabaseHeaders() },
+      8000
+    );
+    const tenant = tRes.ok ? (await tRes.json())[0] : null;
+    if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
+
+    const assessment = await assessLead({
+      name: 'Test Customer',
+      message: String(message).slice(0, 2000),
+      platform: 'Instagram (test)',
+      businessName: tenant.business_name,
+      businessContext: tenant.business_description,
+      knowledgeBase: tenant.knowledge_base,
+      history: Array.isArray(history) ? history.slice(-10) : []
+    });
+
+    if (!assessment) return res.status(502).json({ error: 'The AI did not respond - try again' });
+    res.json(assessment);
+  } catch (err) {
+    console.error('Test-reply failed:', err.message);
+    res.status(500).json({ error: 'Something went wrong' });
+  }
 });
 
 // Models are tried in order, one per attempt, so if one is overloaded or
@@ -1312,4 +1411,5 @@ app.listen(3000, function () {
   startTokenRenewal();
   detectNudgeColumns();
   startStaleChatNudges();
+  detectSenderIdColumn();
 });
