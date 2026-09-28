@@ -42,15 +42,19 @@ function ConversationCard({ group }) {
   );
 }
 
-export default function LeadsPage() {
+// `source` picks which table/view to read from: 'leads_v2' (admin - every
+// tenant) or 'my_leads' (client - just their own business, via the view
+// that Supabase's security rules scope to the logged-in user automatically).
+export default function LeadsPage({ source = 'leads_v2' }) {
   const [leads, setLeads] = useState(null);
   const [error, setError] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
+    setLeads(null);
 
     supabase
-      .from('leads_v2')
+      .from(source)
       .select('*')
       .order('created_at', { ascending: false })
       .limit(300)
@@ -63,7 +67,7 @@ export default function LeadsPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [source]);
 
   // `leads` is newest-first. Group each customer's messages together (by
   // tenant + sender_id), keeping that same newest-first order inside each
