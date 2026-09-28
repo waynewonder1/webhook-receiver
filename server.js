@@ -862,33 +862,107 @@ async function processLeadInBackground(leadId, name, message, email, platform, n
       text = `(Testing mode - this would normally go to ${intendedRecipient})\n\n${text}`;
     }
 
-    const emailResponse = await fetchWithTimeout(
-      'https://api.resend.com/emails',
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ from: MAIL_FROM, to: actualRecipient, subject, text })
-      },
-      10000
-    );
+    const sent = await sendResendEmail(actualRecipient, subject, text);
+    if (sent) console.log('Email sent for lead:', leadId, '- to:', actualRecipient);
 
-    const emailResult = await emailResponse.json();
-    if (!emailResponse.ok) {
-      console.error('Resend API error for lead', leadId, '-', JSON.stringify(emailResult));
-    } else {
-      console.log('Email accepted by Resend for lead:', leadId, '- id:', emailResult.id, '- to:', actualRecipient);
-      // The shared onboarding@resend.dev sender is accepted (200) but only
-      // actually delivered to the Resend account owner's own address.
-      if (MAIL_FROM === 'onboarding@resend.dev' && !override) {
-        console.warn('NOTE: MAIL_FROM is onboarding@resend.dev - Resend will only DELIVER this if', actualRecipient, 'is your Resend signup email. Set NOTIFY_OVERRIDE_EMAIL for testing, or verify a domain for production.');
+    if (paused && nudgeColumnsEnabled) {
+      try {
+        await updateLead(leadId, { handled_by_owner: true });
+      } catch (err) {
+        console.error('Could not flag lead', leadId, 'for the stale-chat nudge:', err.message);
       }
     }
   } catch (err) {
     console.error('Post-save processing failed for lead', leadId, '-', err.message);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Nudge: a lead left with "you're handling this chat" (see humanIsHandling
+// above) has no reply sent by the assistant. If nobody follows up, the lead
+// could just go cold with everyone assuming someone else has it. So once,
+// a few hours after such a lead comes in, we send one reminder email.
+//
+// This does NOT check whether you actually already replied on Instagram - it
+// only knows the lead was left unanswered by the ASSISTANT. Worst case, you
+// get one harmless "still waiting on you" for a chat you'd already finished.
+// Requires leads_v2.handled_by_owner and leads_v2.nudge_sent_at (optional -
+// without them this feature is simply skipped).
+const NUDGE_AFTER_MS = 3 * 60 * 60 * 1000;
+const NUDGE_CHECK_EVERY_MS = 30 * 60 * 1000;
+let nudgeColumnsEnabled = false;
+
+async function detectNudgeColumns() {
+  try {
+    const response = await fetchWithTimeout(
+      `${process.env.SUPABASE_URL}/rest/v1/leads_v2?select=handled_by_owner,nudge_sent_at&limit=1`,
+      { headers: supabaseHeaders() },
+      8000
+    );
+    nudgeColumnsEnabled = response.ok;
+    if (response.ok) {
+      console.log('Stale-chat nudge ENABLED (leads_v2.handled_by_owner / nudge_sent_at present)');
+    } else {
+      console.warn('leads_v2.handled_by_owner / nudge_sent_at not found - stale-chat nudge disabled. To enable it run:\n  alter table leads_v2 add column if not exists handled_by_owner boolean;\n  alter table leads_v2 add column if not exists nudge_sent_at timestamptz;');
+    }
+  } catch (err) {
+    console.warn('Could not probe leads_v2 nudge columns:', err.message);
+  }
+}
+
+async function sendStaleChatNudges() {
+  if (!nudgeColumnsEnabled) return;
+
+  const response = await fetchWithTimeout(
+    `${process.env.SUPABASE_URL}/rest/v1/leads_v2?handled_by_owner=eq.true&nudge_sent_at=is.null&select=id,created_at,name,message,platform,tenant_id&order=created_at.asc&limit=50`,
+    { headers: supabaseHeaders() },
+    8000
+  );
+  if (!response.ok) {
+    console.error('Nudge check: could not load leads:', response.status);
+    return;
+  }
+
+  for (const lead of await response.json()) {
+    if (Date.now() - Date.parse(lead.created_at) < NUDGE_AFTER_MS) continue;
+
+    let tenant = null;
+    if (lead.tenant_id != null) {
+      try {
+        const tRes = await fetchWithTimeout(
+          `${process.env.SUPABASE_URL}/rest/v1/tenants?id=eq.${lead.tenant_id}&select=business_name,notification_email`,
+          { headers: supabaseHeaders() },
+          8000
+        );
+        if (tRes.ok) tenant = (await tRes.json())[0] || null;
+      } catch (err) {
+        console.error('Nudge: tenant lookup failed for lead', lead.id, '-', err.message);
+      }
+    }
+
+    const to = process.env.NOTIFY_OVERRIDE_EMAIL || (tenant && tenant.notification_email);
+    const label = tenant && tenant.business_name ? `[${tenant.business_name}] ` : '';
+    const subject = `${label}Reminder: ${lead.name} is still waiting on you`;
+    const text = `This ${lead.platform} lead came in over ${Math.round((Date.now() - Date.parse(lead.created_at)) / 3600000)} hours ago while you were already handling that chat, so the assistant stayed quiet.\n\n` +
+      `From:    ${lead.name}\nMessage: ${lead.message}\n\n` +
+      'If you already replied, there is nothing to do - this is a one-time reminder, not a repeating alert.';
+
+    await sendResendEmail(to, subject, text);
+
+    // Marked as done either way, sent or not, so a lead with no notification
+    // email configured doesn't get retried forever.
+    try {
+      await updateLead(lead.id, { nudge_sent_at: new Date().toISOString() });
+    } catch (err) {
+      console.error('Could not mark nudge sent for lead', lead.id, '-', err.message);
+    }
+  }
+}
+
+function startStaleChatNudges() {
+  const run = () => sendStaleChatNudges().catch((err) => console.error('Nudge check crashed:', err.message));
+  setTimeout(run, 90 * 1000).unref();
+  setInterval(run, NUDGE_CHECK_EVERY_MS).unref();
 }
 
 // "Connect Instagram" - lets a client authorize their own account
@@ -1139,21 +1213,37 @@ async function renewInstagramToken(token) {
   return { token: data.access_token, expiresIn: data.expires_in };
 }
 
-async function sendAdminAlert(subject, text) {
-  const to = process.env.NOTIFY_OVERRIDE_EMAIL || process.env.MAIL_TO;
+// Shared by every place that emails you or a client: lead alerts, admin
+// alerts (token dying), and the stale-lead nudge below.
+async function sendResendEmail(to, subject, text) {
   if (!to || !process.env.RESEND_API_KEY) {
-    console.error('ALERT (no email configured):', subject);
-    return;
+    console.error('Cannot send email (no recipient or no RESEND_API_KEY):', subject);
+    return false;
   }
   try {
-    await fetchWithTimeout('https://api.resend.com/emails', {
+    const response = await fetchWithTimeout('https://api.resend.com/emails', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ from: MAIL_FROM, to, subject, text })
     }, 10000);
+    const result = await response.json();
+    if (!response.ok) {
+      console.error('Resend API error:', JSON.stringify(result));
+      return false;
+    }
+    if (MAIL_FROM === 'onboarding@resend.dev' && !process.env.NOTIFY_OVERRIDE_EMAIL) {
+      console.warn('NOTE: MAIL_FROM is onboarding@resend.dev - Resend will only DELIVER this if', to, 'is your Resend signup email.');
+    }
+    return true;
   } catch (err) {
-    console.error('Could not send alert email:', err.message);
+    console.error('Could not send email:', err.message);
+    return false;
   }
+}
+
+async function sendAdminAlert(subject, text) {
+  const to = process.env.NOTIFY_OVERRIDE_EMAIL || process.env.MAIL_TO;
+  await sendResendEmail(to, subject, text);
 }
 
 async function renewTenantTokens() {
@@ -1220,4 +1310,6 @@ app.listen(3000, function () {
   detectPersistentDedupe();
   detectTokenExpiryColumn();
   startTokenRenewal();
+  detectNudgeColumns();
+  startStaleChatNudges();
 });
