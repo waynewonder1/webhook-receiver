@@ -1114,6 +1114,48 @@ function readState(state) {
   }
 }
 
+// The Instagram product can have its own app secret, separate from the Meta
+// app's. Use INSTAGRAM_APP_SECRET when set, otherwise the Meta one.
+function instagramAppSecret() {
+  return process.env.INSTAGRAM_APP_SECRET || process.env.META_APP_SECRET;
+}
+
+// Instagram has rejected the documented GET exchange with "Unsupported
+// request - method type: get" for some accounts, so fall back to the
+// versioned path and then a POST before giving up.
+async function exchangeForLongLivedToken(shortToken) {
+  const params = new URLSearchParams({
+    grant_type: 'ig_exchange_token',
+    client_secret: instagramAppSecret(),
+    access_token: shortToken
+  }).toString();
+  const attempts = [
+    { label: 'GET', url: `https://graph.instagram.com/access_token?${params}`, options: {} },
+    { label: 'GET v26.0', url: `https://graph.instagram.com/v26.0/access_token?${params}`, options: {} },
+    {
+      label: 'POST',
+      url: 'https://graph.instagram.com/access_token',
+      options: { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params }
+    }
+  ];
+
+  const failures = [];
+  for (const attempt of attempts) {
+    try {
+      const res = await fetchWithTimeout(attempt.url, attempt.options, 10000);
+      const data = await res.json();
+      if (res.ok && data.access_token) {
+        if (failures.length) console.log(`Long-lived token exchange worked via ${attempt.label} after:`, failures.join(' | '));
+        return data;
+      }
+      failures.push(`${attempt.label}: ${JSON.stringify(data)}`);
+    } catch (err) {
+      failures.push(`${attempt.label}: ${err.message}`);
+    }
+  }
+  throw new Error('Long-lived token exchange failed: ' + failures.join(' | '));
+}
+
 function connectPage(res, status, title, message) {
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   res.status(status).type('html').send(
@@ -1166,7 +1208,7 @@ app.get('/connect/instagram/callback', async function (req, res) {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
         client_id: process.env.INSTAGRAM_APP_ID,
-        client_secret: process.env.META_APP_SECRET,
+        client_secret: instagramAppSecret(),
         grant_type: 'authorization_code',
         redirect_uri: redirectUri,
         code: req.query.code
@@ -1179,19 +1221,7 @@ app.get('/connect/instagram/callback', async function (req, res) {
     }
 
     // 2. Short-lived -> long-lived token (about 60 days)
-    const longRes = await fetchWithTimeout(
-      'https://graph.instagram.com/access_token?' + new URLSearchParams({
-        grant_type: 'ig_exchange_token',
-        client_secret: process.env.META_APP_SECRET,
-        access_token: shortEntry.access_token
-      }).toString(),
-      {},
-      10000
-    );
-    const longData = await longRes.json();
-    if (!longRes.ok || !longData.access_token) {
-      throw new Error('Long-lived token exchange failed: ' + JSON.stringify(longData));
-    }
+    const longData = await exchangeForLongLivedToken(shortEntry.access_token);
     const token = longData.access_token;
 
     // 3. Who connected? user_id here is the same ID the webhook sends. It is
