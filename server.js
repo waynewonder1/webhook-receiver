@@ -359,6 +359,8 @@ function extractInstagramMessages(body) {
         continue;
       }
       if (msg.is_echo) continue;
+      // The customer unsent a message - nothing to answer.
+      if (msg.is_deleted) continue;
 
       const senderId = event.sender && event.sender.id;
       if (!senderId || !recipientId) continue;
