@@ -10,7 +10,7 @@ function esc(s) {
 
 function brand() {
   return {
-    name: process.env.BRAND_NAME || 'IgAgent',
+    name: process.env.BRAND_NAME || 'AutoAgent',
     email: process.env.CONTACT_EMAIL || 'wonderwayne2006@gmail.com'
   };
 }
