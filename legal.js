@@ -10,8 +10,8 @@ function esc(s) {
 
 function brand() {
   return {
-    name: process.env.BRAND_NAME || 'Instagram DM Assistant',
-    email: process.env.CONTACT_EMAIL || process.env.MAIL_TO || ''
+    name: process.env.BRAND_NAME || 'IgAgent',
+    email: process.env.CONTACT_EMAIL || 'wonderwayne2006@gmail.com'
   };
 }
 
