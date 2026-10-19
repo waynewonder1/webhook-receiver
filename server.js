@@ -12,6 +12,8 @@ app.get('/health', function (req, res) {
   res.status(200).json({ ok: true, uptime: Math.round(process.uptime()), commit: (process.env.RENDER_GIT_COMMIT || 'local').slice(0, 7) });
 });
 
+require('./legal').registerLegalRoutes(app);
+
 app.use(function (req, res, next) {
   console.log('Incoming request:', req.method, req.path);
   next();
