@@ -21,7 +21,7 @@ export default function Login() {
 
   return (
     <div className="login-wrap">
-      <p className="eyebrow">Admin access</p>
+      <p className="eyebrow">Dashboard access</p>
       <h1 className="page-title">
         Sign <span className="accent">in.</span>
       </h1>

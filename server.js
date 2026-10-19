@@ -25,6 +25,21 @@ app.use(express.json({
   }
 }));
 
+// The dashboard is served from another origin and calls /api/* with the
+// signed-in user's token, so every API route answers CORS preflights.
+app.use('/api', function (req, res, next) {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// When each Instagram account last received a DM (any tenant, active or not).
+// The Setup page uses it to show a client their test message arrived. In
+// memory only - it just needs to cover the few minutes of a setup.
+const lastInboundAt = new Map();
+
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -637,6 +652,7 @@ app.post('/webhook', async function (req, res) {
 
     const messages = extractInstagramMessages(req.body);
     console.log(`Instagram payload: ${messages.length} inbound message(s)`);
+    for (const m of messages) lastInboundAt.set(String(m.recipientId), Date.now());
 
     for (const msg of messages) {
       handleInstagramLead(msg).catch(function (err) {
@@ -1158,12 +1174,15 @@ async function exchangeForLongLivedToken(shortToken) {
   throw new Error('Long-lived token exchange failed: ' + failures.join(' | '));
 }
 
-function connectPage(res, status, title, message) {
+function connectPage(res, status, title, message, link) {
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const button = link && /^https?:\/\//.test(link.href)
+    ? `<p><a href="${esc(link.href)}" style="display:inline-block;margin-top:12px;padding:12px 20px;background:#eef0ed;color:#0a0d0d;border-radius:6px;text-decoration:none;font-weight:600">${esc(link.label)}</a></p>`
+    : '';
   res.status(status).type('html').send(
     `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>` +
     '<style>body{font-family:system-ui,sans-serif;background:#0a0d0d;color:#eef0ed;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:24px}main{max-width:440px}h1{font-size:28px;margin:0 0 12px}p{color:#9aa3a0;line-height:1.5}</style>' +
-    `</head><body><main><h1>${esc(title)}</h1><p>${esc(message)}</p></main></body></html>`
+    `</head><body><main><h1>${esc(title)}</h1><p>${esc(message)}</p>${button}</main></body></html>`
   );
 }
 
@@ -1176,17 +1195,22 @@ app.get('/connect/instagram', function (req, res) {
   }
 
   const label = String(req.query.label || '').slice(0, 80) || null;
+  res.redirect(instagramAuthorizeUrl(req, { t: Date.now(), label }));
+});
+
+// Instagram's approval screen. The signed state comes back to the callback;
+// a self-serve client's state also carries their login (owner) and email.
+function instagramAuthorizeUrl(req, statePayload) {
   const url = new URL('https://www.instagram.com/oauth/authorize');
   url.search = new URLSearchParams({
     client_id: process.env.INSTAGRAM_APP_ID,
     redirect_uri: `${publicBaseUrl(req)}/connect/instagram/callback`,
     response_type: 'code',
     scope: INSTAGRAM_SCOPES,
-    state: signState({ t: Date.now(), label })
+    state: signState(statePayload)
   }).toString();
-
-  res.redirect(url.toString());
-});
+  return url.toString();
+}
 
 app.get('/connect/instagram/callback', async function (req, res) {
   if (!process.env.INSTAGRAM_APP_ID || !process.env.META_APP_SECRET) {
@@ -1256,15 +1280,41 @@ app.get('/connect/instagram/callback', async function (req, res) {
     // 5. Save: update the token if this account already has a tenant row,
     // otherwise create one (switched OFF until its knowledge base is filled in).
     const existingRes = await fetchWithTimeout(
-      `${process.env.SUPABASE_URL}/rest/v1/tenants?instagram_account_id=eq.${encodeURIComponent(igId)}&select=id&limit=1`,
+      `${process.env.SUPABASE_URL}/rest/v1/tenants?instagram_account_id=eq.${encodeURIComponent(igId)}&select=id,owner_user_id&limit=1`,
       { headers: supabaseHeaders() },
       8000
     );
     const existing = existingRes.ok ? await existingRes.json() : null;
     if (!Array.isArray(existing)) throw new Error('Tenant lookup failed');
 
+    // A self-serve client (state.owner) gets exactly one business, linked to
+    // their login. Don't let one login take over an account someone else
+    // already owns, or end up owning two.
+    const back = state.back ? { href: state.back, label: 'Back to setup' } : null;
+    if (state.owner) {
+      if (existing.length > 0 && existing[0].owner_user_id && existing[0].owner_user_id !== state.owner) {
+        return connectPage(res, 409, 'Already connected', `${username ? '@' + username : 'This Instagram account'} is already linked to a different login. Contact us if this is your account.`, back);
+      }
+      const ownedRes = await fetchWithTimeout(
+        `${process.env.SUPABASE_URL}/rest/v1/tenants?owner_user_id=eq.${encodeURIComponent(state.owner)}&select=id,instagram_account_id&limit=1`,
+        { headers: supabaseHeaders() },
+        8000
+      );
+      const owned = ownedRes.ok ? await ownedRes.json() : null;
+      if (!Array.isArray(owned)) throw new Error('Owner lookup failed');
+      if (owned.length > 0 && owned[0].instagram_account_id !== igId) {
+        return connectPage(res, 409, 'Different account', 'Your login is already connected to another Instagram account. Contact us if you want to switch accounts.', back);
+      }
+    }
+
     if (existing.length > 0) {
       await patchTenantToken(existing[0].id, token, longData.expires_in);
+      if (state.owner && !existing[0].owner_user_id) {
+        const ownRes = await fetchWithTimeout(`${process.env.SUPABASE_URL}/rest/v1/tenants?id=eq.${existing[0].id}`, {
+          method: 'PATCH', headers: supabaseHeaders(), body: JSON.stringify({ owner_user_id: state.owner })
+        }, 8000);
+        if (!ownRes.ok) throw new Error('Owner link failed: ' + JSON.stringify(await ownRes.json().catch(() => ({}))));
+      }
       console.log(`Connect: refreshed token for @${username} (${igId}), tenant ${existing[0].id}, webhooks subscribed: ${subscribed}`);
     } else {
       const insertRes = await fetchWithTimeout(`${process.env.SUPABASE_URL}/rest/v1/tenants`, {
@@ -1274,8 +1324,9 @@ app.get('/connect/instagram/callback', async function (req, res) {
           business_name: state.label || (username ? `@${username}` : igId),
           instagram_account_id: igId,
           instagram_access_token: token,
-          notification_email: process.env.MAIL_TO || null,
+          notification_email: state.email || process.env.MAIL_TO || null,
           active: false,
+          ...(state.owner ? { owner_user_id: state.owner } : {}),
           ...tokenExpiryFields(longData.expires_in)
         })
       }, 8000);
@@ -1285,6 +1336,9 @@ app.get('/connect/instagram/callback', async function (req, res) {
     }
     tenantCache.delete(igId);
 
+    if (state.owner) {
+      return connectPage(res, 200, 'Connected', `${username ? '@' + username : 'Your Instagram account'} is now connected. Go back to your setup page for the next step.`, back);
+    }
     return connectPage(res, 200, 'Connected', `${username ? '@' + username : 'Your Instagram account'} is now connected. You can close this page.`);
   } catch (err) {
     console.error('Instagram connect failed:', err.message);
@@ -1437,6 +1491,10 @@ async function patchTenantToken(tenantId, token, expiresInSeconds) {
   );
   if (!response.ok) throw new Error('Token save failed: ' + JSON.stringify(await response.json().catch(() => ({}))));
 }
+
+require('./setup').registerSetupRoutes(app, {
+  fetchWithTimeout, supabaseHeaders, askGemini, sendResendEmail, verifyDashboardUser, safeEqual, instagramAuthorizeUrl, lastInboundAt
+});
 
 app.listen(3000, function () {
   console.log('WebHook receiver running on http://localhost:3000');

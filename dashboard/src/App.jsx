@@ -5,11 +5,14 @@ import TenantsPage from './TenantsPage';
 import LeadsPage from './LeadsPage';
 import TestPage from './TestPage';
 import ClientBusinessPage from './ClientBusinessPage';
+import Signup from './Signup';
+import SetupPage from './SetupPage';
 
 export default function App() {
   const [session, setSession] = useState(undefined); // undefined = still checking
   const [isAdmin, setIsAdmin] = useState(undefined); // undefined = still checking
   const [tab, setTab] = useState(null);
+  const [signupKey, setSignupKey] = useState(() => new URLSearchParams(window.location.search).get('signup'));
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
@@ -31,15 +34,35 @@ export default function App() {
     supabase
       .from('admins')
       .select('user_id')
-      .then(({ data }) => {
+      .then(async ({ data }) => {
         const admin = !!(data && data.length);
-        setIsAdmin(admin);
-        setTab(admin ? 'tenants' : 'business');
+        if (admin) {
+          setIsAdmin(true);
+          setTab('tenants');
+          return;
+        }
+        // A client whose assistant is already on lands on their leads;
+        // anyone still setting up lands on Setup.
+        const { data: business } = await supabase.from('my_business').select('active').maybeSingle();
+        setIsAdmin(false);
+        setTab(business && business.active ? 'leads' : 'setup');
       });
   }, [session]);
 
   if (session === undefined) return <p className="status shell">Loading...</p>;
-  if (session === null) return <Login />;
+  if (session === null) {
+    return signupKey ? (
+      <Signup
+        signupKey={signupKey}
+        onSwitchToLogin={() => {
+          window.history.replaceState(null, '', window.location.pathname);
+          setSignupKey(null);
+        }}
+      />
+    ) : (
+      <Login />
+    );
+  }
   if (isAdmin === undefined) return <p className="status shell">Loading...</p>;
 
   return (
@@ -64,6 +87,9 @@ export default function App() {
             </>
           ) : (
             <>
+              <button className={`nav-link ${tab === 'setup' ? 'active' : ''}`} onClick={() => setTab('setup')}>
+                Setup
+              </button>
               <button className={`nav-link ${tab === 'business' ? 'active' : ''}`} onClick={() => setTab('business')}>
                 Business
               </button>
@@ -90,6 +116,7 @@ export default function App() {
         </>
       ) : (
         <>
+          {tab === 'setup' && <SetupPage onFinished={() => setTab('leads')} />}
           {tab === 'business' && <ClientBusinessPage />}
           {tab === 'leads' && <LeadsPage source="my_leads" />}
         </>
