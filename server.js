@@ -202,10 +202,14 @@ const NAME_CACHE_LIMIT = 5000;
 // IDs of messages our own server sent, so we can tell a bot reply from one
 // the business owner typed by hand in the Instagram app. In-memory only -
 // same tradeoff as the message dedupe set above (resets on restart), which
-// just means a human takeover right around a restart might go undetected
-// for one message.
+// just means a human takeover right before a restart might go undetected
+// for one message (see SERVER_STARTED_AT).
 const sentMessageIds = new Set();
 const SENT_MESSAGE_LIMIT = 2000;
+// Messages sent before this process started can't be in sentMessageIds, so
+// they're assumed to be the bot's own - otherwise every restart would make
+// the assistant mistake its earlier replies for the owner's and go quiet.
+const SERVER_STARTED_AT = Date.now();
 
 function rememberSent(id) {
   if (!id) return;
@@ -427,13 +431,16 @@ async function getConversationHistory(igId, senderId, accessToken, currentText) 
     return msgs
       .slice(0, HISTORY_MESSAGES)
       .reverse()
-      .map((m) => ({
-        who: m.from && m.from.id === senderId ? 'Customer' : 'Us',
-        text: String(m.message).slice(0, 500),
-        id: m.id || null,
-        time: Date.parse(m.created_time) || null,
-        botSent: sentMessageIds.has(m.id)
-      }));
+      .map((m) => {
+        const time = Date.parse(m.created_time) || null;
+        return {
+          who: m.from && m.from.id === senderId ? 'Customer' : 'Us',
+          text: String(m.message).slice(0, 500),
+          id: m.id || null,
+          time,
+          botSent: sentMessageIds.has(m.id) || (time != null && time < SERVER_STARTED_AT)
+        };
+      });
   } catch (err) {
     console.error('Conversation history lookup threw:', err.message);
     return [];
