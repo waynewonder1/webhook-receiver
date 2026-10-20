@@ -303,9 +303,9 @@ function MessagesStep() {
   return (
     <>
       <p>
-        <strong>1.</strong> In Instagram, open{' '}
-        <em>Settings &rarr; Messages and story replies &rarr; Connected tools</em> and turn on{' '}
-        <strong>Allow access to messages</strong>.
+        <strong>1.</strong> In the Instagram <strong>phone app</strong> (this setting isn&rsquo;t on the website),
+        open <em>&#9776; &rarr; Settings and activity &rarr; Messages and story replies &rarr; Connected tools</em> and
+        turn on <strong>Allow access to messages</strong>.
       </p>
       <p>
         <strong>2.</strong> From a <strong>different</strong> Instagram account (a friend&rsquo;s, or a second account),
